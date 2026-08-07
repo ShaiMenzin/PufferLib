@@ -18,6 +18,7 @@ import pufferlib
 import pufferlib.pufferl
 from pufferlib.muon import Muon
 from pufferlib import _C
+from pufferlib.models import reset_recurrent_state
 if _C.precision_bytes != 4:
     raise RuntimeError(
         f'_C was compiled with bf16 precision (precision_bytes={_C.precision_bytes}). '
@@ -206,14 +207,19 @@ class PuffeRL:
         device = self.device
         horizon = config['horizon']
 
-        self.state = tuple(torch.zeros_like(s) for s in self.state) if self.state else ()
         o = self.vec_obs
-        r = torch.zeros(self.total_agents, device=device)
-        d = torch.zeros(self.total_agents, device=device)
+        r = torch.as_tensor(self.vec_rewards, device=device).float()
+        d = torch.as_tensor(self.vec_terminals, device=device).float()
+        self.rollout_state = None
 
         P = Profile
         prof.mark(0)
         for t in range(horizon):
+            self.state = reset_recurrent_state(self.state, d)
+            if t == 0:
+                self.rollout_state = tuple(
+                    value.detach().clone() for value in self.state
+                )
             o_device = torch.as_tensor(o, device=device)
 
             prof.mark(1)
@@ -277,6 +283,8 @@ class PuffeRL:
         lp = self.logprobs.T.contiguous()
         rew = self.rewards.T.contiguous().clamp(-1, 1)
         ter = self.terminals.T.contiguous()
+        if self.rollout_state is None:
+            raise RuntimeError('rollout state was not captured')
 
         P = Profile
         prof.mark(0)
@@ -301,9 +309,12 @@ class PuffeRL:
             mb_values = val[idx]
             mb_returns = advantages[idx] + mb_values
             mb_advantages = advantages[idx]
+            mb_state = tuple(value[:, idx] for value in self.rollout_state)
+            mb_terminals = ter[idx].bool()
 
             prof.mark(1)
-            logits, newvalue = self.policy(mb_obs)
+            logits, newvalue = self.policy.forward_recurrent_train(
+                mb_obs, mb_state, mb_terminals)
             actions, newlogprob, entropy = sample_logits(logits, action=mb_actions)
             prof.mark(2)
             prof.elapsed(P.TRAIN_FORWARD, 1, 2)
@@ -513,4 +524,3 @@ def load_policy(args, vec):
         policy.load_state_dict(state_dict)
 
     return policy
-

@@ -4,6 +4,14 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+
+def reset_recurrent_state(state, terminals):
+    if not state:
+        return state
+    active = (~terminals.bool()).to(device=state[0].device, dtype=state[0].dtype)
+    mask = active.view(1, -1, 1)
+    return tuple(value * mask for value in state)
+
 class Policy(nn.Module):
     def __init__(self, encoder, decoder, network):
         super().__init__()
@@ -24,6 +32,13 @@ class Policy(nn.Module):
         B, TT = x.shape[:2]
         h = self.encoder(x.reshape(B*TT, *x.shape[2:]))
         h = self.network.forward_train(h.reshape(B, TT, -1))
+        logits, values = self.decoder(h.reshape(B*TT, -1))
+        return logits, values.reshape(B, TT)
+
+    def forward_recurrent_train(self, x, state, terminals):
+        B, TT = x.shape[:2]
+        h = self.encoder(x.reshape(B*TT, *x.shape[2:]))
+        h = self.network.forward_train_recurrent(h.reshape(B, TT, -1), state, terminals)
         logits, values = self.decoder(h.reshape(B*TT, -1))
         return logits, values.reshape(B, TT)
 
@@ -150,6 +165,18 @@ class MinGRU(nn.Module):
             out = self._heinsen_scan(log_coeffs, log_values)[:, -T:]
             h = self._highway(h, out, proj)
         return h
+
+    def forward_train_recurrent(self, h, state, terminals):
+        if terminals.shape != h.shape[:2]:
+            raise ValueError("terminals must have shape [batch, time]")
+
+        outputs = []
+        recurrent_state = tuple(value.clone() for value in state)
+        for step in range(h.shape[1]):
+            recurrent_state = reset_recurrent_state(recurrent_state, terminals[:, step])
+            output, recurrent_state = self.forward_eval(h[:, step], recurrent_state)
+            outputs.append(output)
+        return torch.stack(outputs, dim=1)
 
 class LSTM(nn.Module):
     def __init__(self, hidden_size, num_layers=1, **kwargs):
