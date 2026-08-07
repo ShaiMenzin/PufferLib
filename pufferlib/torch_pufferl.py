@@ -439,7 +439,7 @@ class PuffeRL:
         self._vec.close()
 
     @classmethod
-    def create_pufferl(cls, args):
+    def create_pufferl(cls, args, policy_factory=None):
         '''Matches _C.create_pufferl(args) interface.'''
         # DDP setup
         if 'LOCAL_RANK' in os.environ:
@@ -450,7 +450,11 @@ class PuffeRL:
 
         args['vec']['num_buffers'] = 1
         vec = _C.create_vec(args, _C.gpu)
-        policy = load_policy(args, vec)
+        if policy_factory is None:
+            policy = load_policy(args, vec)
+        else:
+            device = torch.device('cuda' if _C.gpu else 'cpu')
+            policy = policy_factory(vec, device).to(device)
 
         if 'LOCAL_RANK' in os.environ:
             torch.distributed.init_process_group(backend='nccl', world_size=world_size)
