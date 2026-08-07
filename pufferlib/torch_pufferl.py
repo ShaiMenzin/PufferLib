@@ -170,12 +170,25 @@ class PuffeRL:
         if args['torch'].get('compile_evaluation', False):
             self._forward_eval = torch.compile(
                 self._forward_eval, mode='reduce-overhead', fullgraph=True)
-        self.optimizer = Muon(
-            self.policy.parameters(),
-            lr=config['learning_rate'],
-            momentum=config['beta1'],
-            eps=config['eps'],
-        )
+        optimizer = config.get('optimizer', 'muon')
+        if optimizer == 'muon':
+            self.optimizer = Muon(
+                self.policy.parameters(),
+                lr=config['learning_rate'],
+                momentum=config['beta1'],
+                weight_decay=config.get('weight_decay', 0.0),
+                eps=config['eps'],
+            )
+        elif optimizer == 'adamw':
+            self.optimizer = torch.optim.AdamW(
+                self.policy.parameters(),
+                lr=config['learning_rate'],
+                betas=(config['beta1'], config['beta2']),
+                weight_decay=config.get('weight_decay', 0.0),
+                eps=config['eps'],
+            )
+        else:
+            raise ValueError(f'Unsupported optimizer: {optimizer}')
 
         self.args = args
         self.config = config
@@ -293,6 +306,7 @@ class PuffeRL:
         P = Profile
         prof.mark(0)
         num_minibatches = int(config['replay_ratio'] * self.batch_size / config['minibatch_size'])
+        completed_minibatches = 0
         for _mb in range(num_minibatches):
             shape = val.shape
             advantages = torch.zeros(shape, device=device)
@@ -362,11 +376,16 @@ class PuffeRL:
             torch.nn.utils.clip_grad_norm_(self.policy.parameters(), config['max_grad_norm'])
             self.optimizer.step()
             self.optimizer.zero_grad()
+            completed_minibatches += 1
+            target_kl = config.get('target_kl', 0.0)
+            if target_kl > 0 and approx_kl.item() > target_kl:
+                break
 
         prof.mark(1)
         prof.elapsed(P.TRAIN, 0, 1)
 
-        losses = {k: v.item() / num_minibatches for k, v in losses.items()}
+        losses = {k: v.item() / completed_minibatches for k, v in losses.items()}
+        losses['completed_minibatches'] = completed_minibatches
         y_pred = val.flatten()
         y_true = advantages.flatten() + val.flatten()
         var_y = y_true.var()
