@@ -19,6 +19,7 @@ import pufferlib.pufferl
 from pufferlib.muon import Muon
 from pufferlib import _C
 from pufferlib.models import reset_recurrent_state
+from pufferlib.rewards import training_rewards
 if _C.precision_bytes != 4:
     raise RuntimeError(
         f'_C was compiled with bf16 precision (precision_bytes={_C.precision_bytes}). '
@@ -281,7 +282,7 @@ class PuffeRL:
         act = self.actions.transpose(0, 1).contiguous()
         val = self.values.T.contiguous()
         lp = self.logprobs.T.contiguous()
-        rew = self.rewards.T.contiguous().clamp(-1, 1)
+        rew = training_rewards(self.rewards.T)
         ter = self.terminals.T.contiguous()
         if self.rollout_state is None:
             raise RuntimeError('rollout state was not captured')
