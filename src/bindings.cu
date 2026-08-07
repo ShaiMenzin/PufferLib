@@ -351,12 +351,9 @@ void vec_reset(VecEnv& ve) {
 }
 
 void gpu_vec_step_py(VecEnv& ve, long long actions_ptr) {
-    cudaMemcpy(ve.vec->gpu_actions, (void*)actions_ptr,
-        (size_t)ve.total_agents * ve.num_atns * sizeof(float),
-        cudaMemcpyDeviceToDevice);
     {
         py::gil_scoped_release no_gil;
-        gpu_vec_step(ve.vec);
+        gpu_vec_step_from_device(ve.vec, (const float*)actions_ptr);
     }
 }
 

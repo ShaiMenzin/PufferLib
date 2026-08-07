@@ -1,25 +1,26 @@
-## puffer [train | eval | sweep] [env_name] [optional args] -- See https://puffer.ai for full detail0
+## puffer [train | eval | sweep] [env_name] [optional args]
 # This is the same as python -m pufferlib.pufferl [train | eval | sweep] [env_name] [optional args]
-# Distributed example: torchrun --standalone --nnodes=1 --nproc-per-node=6 -m pufferlib.pufferl train puffer_nmmo3
+# Distributed example: torchrun --standalone --nproc-per-node=6
+# -m pufferlib.pufferl train puffer_nmmo3
 
-import os
-import glob
-import time
 import ctypes
+import glob
+import os
+import time
 from collections import defaultdict
 
 import numpy as np
-
 import torch
 import torch.distributed
 from torch.distributions.utils import logits_to_probs
 
 import pufferlib
 import pufferlib.pufferl
-from pufferlib.muon import Muon
 from pufferlib import _C
 from pufferlib.models import reset_recurrent_state
+from pufferlib.muon import Muon
 from pufferlib.rewards import training_rewards
+
 if _C.precision_bytes != 4:
     raise RuntimeError(
         f'_C was compiled with bf16 precision (precision_bytes={_C.precision_bytes}). '
@@ -61,7 +62,7 @@ def sample_logits(logits, action=None):
         logits = logits.unsqueeze(0)
     else: # multi-discrete
         logits = torch.nn.utils.rnn.pad_sequence(
-            [l.transpose(0,1) for l in logits],
+            [head.transpose(0,1) for head in logits],
             batch_first=False,
             padding_value=-torch.inf
         ).permute(1,2,0)
@@ -165,6 +166,10 @@ class PuffeRL:
         self.total_epochs = max(1, config['total_timesteps'] // self.batch_size)
 
         self.policy = policy
+        self._forward_eval = policy.forward_eval
+        if args['torch'].get('compile_evaluation', False):
+            self._forward_eval = torch.compile(
+                self._forward_eval, mode='reduce-overhead', fullgraph=True)
         self.optimizer = Muon(
             self.policy.parameters(),
             lr=config['learning_rate'],
@@ -225,7 +230,7 @@ class PuffeRL:
 
             prof.mark(1)
             with torch.no_grad():
-                logits, value, state = self.policy.forward_eval(o_device, self.state)
+                logits, value, state = self._forward_eval(o_device, self.state)
                 action, logprob, _ = sample_logits(logits)
             prof.mark(2)
 
@@ -241,9 +246,7 @@ class PuffeRL:
             prof.mark(2)
             actions_flat = _actions_for_vec_step(action)
             if self.gpu:
-                actions_flat = actions_flat.cuda()
                 self._vec.gpu_step(actions_flat.data_ptr())
-                torch.cuda.synchronize()
             else:
                 self._vec.cpu_step(actions_flat.data_ptr())
 
@@ -277,7 +280,7 @@ class PuffeRL:
             learning_rate = lr_min + 0.5*(learning_rate - lr_min) * (1 + np.cos(np.pi * lr_ratio))
             self.optimizer.param_groups[0]['lr'] = learning_rate
 
-        # Transpose from [horizon, agents] (contiguous writes) to [agents, horizon] (minibatch indexing)
+        # Transpose from rollout writes to minibatch indexing.
         obs = self.observations.transpose(0, 1).contiguous()
         act = self.actions.transpose(0, 1).contiguous()
         val = self.values.T.contiguous()
@@ -290,7 +293,7 @@ class PuffeRL:
         P = Profile
         prof.mark(0)
         num_minibatches = int(config['replay_ratio'] * self.batch_size / config['minibatch_size'])
-        for mb in range(num_minibatches):
+        for _mb in range(num_minibatches):
             shape = val.shape
             advantages = torch.zeros(shape, device=device)
             advantages = compute_puff_advantage(val, rew,
@@ -316,7 +319,7 @@ class PuffeRL:
             prof.mark(1)
             logits, newvalue = self.policy.forward_recurrent_train(
                 mb_obs, mb_state, mb_terminals)
-            actions, newlogprob, entropy = sample_logits(logits, action=mb_actions)
+            _, newlogprob, entropy = sample_logits(logits, action=mb_actions)
             prof.mark(2)
             prof.elapsed(P.TRAIN_FORWARD, 1, 2)
 
@@ -421,7 +424,7 @@ class PuffeRL:
         '''Matches _C.create_pufferl(args) interface.'''
         # DDP setup
         if 'LOCAL_RANK' in os.environ:
-            world_size = int(os.environ.get('WORLD_SIZE', 1))
+            world_size = int(os.environ.get('WORLD_SIZE', '1'))
             local_rank = int(os.environ['LOCAL_RANK'])
             torch.cuda.set_device(local_rank)
             os.environ['CUDA_VISIBLE_DEVICES'] = str(local_rank)

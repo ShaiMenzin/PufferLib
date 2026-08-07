@@ -76,6 +76,7 @@ typedef struct StaticVec {
     int total_agents;
     int buffers;
     int agents_per_buffer;
+    int step_threads;
     int* buffer_env_starts;
     int* buffer_env_counts;
     void* observations;
@@ -134,6 +135,7 @@ size_t get_obs_elem_size(void);
 // Synchronous single-step
 void static_vec_step(StaticVec* vec);
 void gpu_vec_step(StaticVec* vec);
+void gpu_vec_step_from_device(StaticVec* vec, const float* actions);
 void cpu_vec_step(StaticVec* vec);
 
 // Optional permutation. Sets agent_perm and re-populates env per-slot pointers
@@ -404,6 +406,8 @@ StaticVec* create_static_vec(int total_agents, int num_buffers, int gpu, Dict* v
     vec->total_agents = total_agents;
     vec->buffers = num_buffers;
     vec->agents_per_buffer = total_agents / num_buffers;
+    vec->step_threads = (int)dict_get(vec_kwargs, "num_threads")->value;
+    if (vec->step_threads < 1) vec->step_threads = 1;
     vec->obs_size = OBS_SIZE;
     vec->num_atns = NUM_ATNS;
     vec->gpu = gpu;
@@ -742,15 +746,15 @@ static inline void _static_vec_env_step(StaticVec* vec) {
     memset(vec->rewards, 0, vec->total_agents * sizeof(float));
     memset(vec->terminals, 0, vec->total_agents * sizeof(float));
     Env* envs = (Env*)vec->envs;
-    #pragma omp parallel for schedule(static)
+    #pragma omp parallel for schedule(static) num_threads(vec->step_threads)
     for (int i = 0; i < vec->size; i++) {
         c_step(&envs[i]);
     }
 }
 
-void gpu_vec_step(StaticVec* vec) {
+void gpu_vec_step_from_device(StaticVec* vec, const float* actions) {
     assert(vec->buffers == 1);
-    cudaMemcpy(vec->actions, vec->gpu_actions,
+    cudaMemcpy(vec->actions, actions,
         (size_t)vec->total_agents * NUM_ATNS * sizeof(float),
         cudaMemcpyDeviceToHost);
     _static_vec_env_step(vec);
@@ -761,6 +765,10 @@ void gpu_vec_step(StaticVec* vec) {
         vec->total_agents * sizeof(float), cudaMemcpyHostToDevice);
     cudaMemcpy(vec->gpu_terminals, vec->terminals,
         vec->total_agents * sizeof(float), cudaMemcpyHostToDevice);
+}
+
+void gpu_vec_step(StaticVec* vec) {
+    gpu_vec_step_from_device(vec, vec->gpu_actions);
 }
 
 void cpu_vec_step(StaticVec* vec) {

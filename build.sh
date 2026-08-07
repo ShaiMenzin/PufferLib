@@ -229,6 +229,8 @@ fi
 if [ -z "$NCCL_LFLAG" ]; then
     NCCL_LFLAG=$(python -c "import nvidia.nccl, os; print('-L' + os.path.join(nvidia.nccl.__path__[0], 'lib'))" 2>/dev/null || echo "")
 fi
+CUDNN_LINK_LIBRARY=${CUDNN_LINK_LIBRARY:--lcudnn}
+NCCL_LINK_LIBRARY=${NCCL_LINK_LIBRARY:--lnccl}
 
 WHEEL_RPATH_FLAGS=()
 for lib_flag in "$CUDNN_LFLAG" "$NCCL_LFLAG"; do
@@ -300,7 +302,7 @@ if [ -z "$MODE" ]; then
         -L$CUDA_HOME/lib64 $CUDNN_LFLAG $NCCL_LFLAG
         "${WHEEL_RPATH_FLAGS[@]}"
         "${EXTRA_LDFLAGS[@]}"
-        -lcudart -lnccl -lnvidia-ml -lcublas -lcusolver -lcurand -lcudnn
+        -lcudart $NCCL_LINK_LIBRARY -lnvidia-ml -lcublas -lcusolver -lcurand $CUDNN_LINK_LIBRARY
         $OMP_LIB $LINK_OPT
         "${SHARED_LDFLAGS[@]}"
         -o "$OUTPUT"
@@ -343,7 +345,7 @@ elif [ "$MODE" = "profile" ]; then
         -Xcompiler=-fopenmp \
         tests/profile_kernels.cu vendor/ini.c \
         "$STATIC_LIB" "$RAYLIB_A" \
-        -lnccl -lnvidia-ml -lcublas -lcurand -lcudnn \
+        $NCCL_LINK_LIBRARY -lnvidia-ml -lcublas -lcurand $CUDNN_LINK_LIBRARY \
         -lGL -lm -lpthread $OMP_LIB \
         -o profile
     echo "Built: ./profile"
