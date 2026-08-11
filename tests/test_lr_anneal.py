@@ -1,4 +1,10 @@
-from pufferlib.schedules import learning_rate_at_epoch
+import pytest
+from pufferlib.schedules import learning_rate_at_epoch, rollout_epochs
+
+
+def test_rollout_epochs_reject_a_partial_batch() -> None:
+    with pytest.raises(ValueError, match="divisible"):
+        rollout_epochs(total_timesteps=129, batch_size=128)
 
 
 def test_lr_annealing_uses_an_absolute_timestep_horizon() -> None:

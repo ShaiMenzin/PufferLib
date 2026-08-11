@@ -19,7 +19,7 @@ from pufferlib import _C
 from pufferlib.models import reset_recurrent_state
 from pufferlib.muon import Muon
 from pufferlib.rewards import training_rewards
-from pufferlib.schedules import learning_rate_at_epoch
+from pufferlib.schedules import learning_rate_at_epoch, rollout_epochs
 
 if _C.precision_bytes != 4:
     raise RuntimeError(
@@ -165,7 +165,7 @@ class PuffeRL:
 
         self.batch_size = total_agents * horizon
         self.minibatch_segments = config['minibatch_size'] // horizon
-        self.total_epochs = max(1, config['total_timesteps'] // self.batch_size)
+        self.total_epochs = rollout_epochs(config['total_timesteps'], self.batch_size)
 
         self.policy = policy
         self._forward_eval = policy.forward_eval
