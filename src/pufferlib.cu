@@ -1427,6 +1427,81 @@ __global__ void puff_advantage_scalar(const precision_t* values, const precision
         importance + offset, advantages + offset, gamma, lambda, rho_clip, c_clip, horizon);
 }
 
+__device__ __forceinline__ void puff_advantage_aligned_row_vec(
+        const precision_t* values, const precision_t* rewards, const precision_t* dones,
+        const precision_t* importance, precision_t* advantages, float bootstrap_value,
+        float gamma, float lambda, float rho_clip, float c_clip, int horizon) {
+    constexpr int N = 16 / sizeof(precision_t);
+    float lastpufferlam = 0.0f;
+    float next_value = bootstrap_value;
+    int num_chunks = horizon / N;
+
+    for (int chunk = num_chunks - 1; chunk >= 0; chunk--) {
+        int base = chunk * N;
+        float v[N], r[N], d[N], imp[N];
+        adv_vec_load(values + base, v);
+        adv_vec_load(rewards + base, r);
+        adv_vec_load(dones + base, d);
+        adv_vec_load(importance + base, imp);
+
+        float adv[N];
+        #pragma unroll
+        for (int i = N - 1; i >= 0; i--) {
+            float nextnonterminal = 1.0f - d[i];
+            float rho_t = fminf(imp[i], rho_clip);
+            float c_t = fminf(imp[i], c_clip);
+            float delta = rho_t * (
+                r[i] + gamma * next_value * nextnonterminal - v[i]);
+            lastpufferlam = delta
+                + gamma * lambda * c_t * lastpufferlam * nextnonterminal;
+            adv[i] = lastpufferlam;
+            next_value = v[i];
+        }
+        adv_vec_store(advantages + base, adv);
+    }
+}
+
+__global__ void puff_advantage_aligned(
+        const precision_t* values, const precision_t* rewards,
+        const precision_t* dones, const precision_t* importance,
+        precision_t* advantages, const precision_t* bootstrap_values,
+        float gamma, float lambda, float rho_clip, float c_clip,
+        int num_steps, int horizon) {
+    int row = blockIdx.x * blockDim.x + threadIdx.x;
+    if (row >= num_steps) return;
+    int offset = row * horizon;
+    puff_advantage_aligned_row_vec(
+        values + offset, rewards + offset, dones + offset, importance + offset,
+        advantages + offset, to_float(bootstrap_values[row]), gamma, lambda,
+        rho_clip, c_clip, horizon);
+}
+
+__global__ void puff_advantage_aligned_scalar(
+        const precision_t* values, const precision_t* rewards,
+        const precision_t* dones, const precision_t* importance,
+        precision_t* advantages, const precision_t* bootstrap_values,
+        float gamma, float lambda, float rho_clip, float c_clip,
+        int num_steps, int horizon) {
+    int row = blockIdx.x * blockDim.x + threadIdx.x;
+    if (row >= num_steps) return;
+    int offset = row * horizon;
+    float lastpufferlam = 0.0f;
+    float next_value = to_float(bootstrap_values[row]);
+    for (int t = horizon - 1; t >= 0; t--) {
+        float nextnonterminal = 1.0f - to_float(dones[offset + t]);
+        float rho_t = fminf(to_float(importance[offset + t]), rho_clip);
+        float c_t = fminf(to_float(importance[offset + t]), c_clip);
+        float value = to_float(values[offset + t]);
+        float delta = rho_t * (
+            to_float(rewards[offset + t])
+            + gamma * next_value * nextnonterminal - value);
+        lastpufferlam = delta
+            + gamma * lambda * c_t * lastpufferlam * nextnonterminal;
+        advantages[offset + t] = from_float(lastpufferlam);
+        next_value = value;
+    }
+}
+
 void puff_advantage_cuda(PrecisionTensor& values, PrecisionTensor& rewards,
         PrecisionTensor& dones, PrecisionTensor& importance, PrecisionTensor& advantages,
         float gamma, float lambda, float rho_clip, float c_clip, cudaStream_t stream) {

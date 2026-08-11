@@ -158,6 +158,8 @@ class PuffeRL:
         self.logprobs = torch.zeros(horizon, total_agents, device=device)
         self.rewards = torch.zeros(horizon, total_agents, device=device)
         self.terminals = torch.zeros(horizon, total_agents, device=device)
+        self.episode_starts = torch.zeros(horizon, total_agents, device=device)
+        self.bootstrap_values = torch.zeros(total_agents, device=device)
         self.ratio = torch.ones(total_agents, horizon, device=device)
         self.state = policy.initial_state(total_agents, device=device)
 
@@ -252,8 +254,7 @@ class PuffeRL:
                 self.observations[t] = o_device
                 self.actions[t] = action
                 self.logprobs[t] = logprob
-                self.rewards[t] = torch.as_tensor(r, device=device)
-                self.terminals[t] = torch.as_tensor(d, device=device).float()
+                self.episode_starts[t] = torch.as_tensor(d, device=device).float()
                 self.values[t] = value.flatten()
 
             prof.mark(2)
@@ -264,9 +265,21 @@ class PuffeRL:
                 self._vec.cpu_step(actions_flat.data_ptr())
 
             o, r, d = self.vec_obs, self.vec_rewards, self.vec_terminals
+            with torch.no_grad():
+                self.rewards[t] = torch.as_tensor(r, device=device)
+                self.terminals[t] = torch.as_tensor(d, device=device).float()
             prof.mark(3)
             prof.elapsed(P.EVAL_GPU, 1, 2)
             prof.elapsed(P.EVAL_ENV, 2, 3)
+
+        with torch.no_grad():
+            bootstrap_state = reset_recurrent_state(self.state, d)
+            bootstrap_observation = torch.as_tensor(o, device=device)
+            _, bootstrap_value, _ = self._forward_eval(
+                bootstrap_observation,
+                bootstrap_state,
+            )
+            self.bootstrap_values = bootstrap_value.flatten()
 
         prof.mark(1)
         prof.elapsed(P.ROLLOUT, 0, 1)
@@ -296,6 +309,7 @@ class PuffeRL:
         lp = self.logprobs.T.contiguous()
         rew = training_rewards(self.rewards.T)
         ter = self.terminals.T.contiguous()
+        episode_starts = self.episode_starts.T.contiguous()
         if self.rollout_state is None:
             raise RuntimeError('rollout state was not captured')
 
@@ -307,7 +321,7 @@ class PuffeRL:
             shape = val.shape
             advantages = torch.zeros(shape, device=device)
             advantages = compute_puff_advantage(val, rew,
-                ter, self.ratio, advantages, config['gamma'],
+                ter, self.ratio, advantages, self.bootstrap_values, config['gamma'],
                 config['gae_lambda'], config['vtrace_rho_clip'], config['vtrace_c_clip'])
 
             adv = advantages.abs().sum(axis=1)
@@ -324,11 +338,11 @@ class PuffeRL:
             mb_returns = advantages[idx] + mb_values
             mb_advantages = advantages[idx]
             mb_state = tuple(value[:, idx] for value in self.rollout_state)
-            mb_terminals = ter[idx].bool()
+            mb_episode_starts = episode_starts[idx].bool()
 
             prof.mark(1)
             logits, newvalue = self.policy.forward_recurrent_train(
-                mb_obs, mb_state, mb_terminals)
+                mb_obs, mb_state, mb_episode_starts)
             _, newlogprob, entropy = sample_logits(logits, action=mb_actions)
             prof.mark(2)
             prof.elapsed(P.TRAIN_FORWARD, 1, 2)
@@ -466,12 +480,14 @@ class PuffeRL:
         return cls(args, vec, policy)
 
 def compute_puff_advantage(values, rewards, terminals,
-        ratio, advantages, gamma, gae_lambda, vtrace_rho_clip, vtrace_c_clip):
+        ratio, advantages, bootstrap_values, gamma, gae_lambda,
+        vtrace_rho_clip, vtrace_c_clip):
     num_steps, horizon = values.shape
     fn = _C.puff_advantage if values.is_cuda else _C.puff_advantage_cpu
     fn(
         values.data_ptr(), rewards.data_ptr(), terminals.data_ptr(),
         ratio.data_ptr(), advantages.data_ptr(),
+        bootstrap_values.data_ptr(),
         num_steps, horizon,
         gamma, gae_lambda, vtrace_rho_clip, vtrace_c_clip)
     return advantages

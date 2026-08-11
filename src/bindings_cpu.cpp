@@ -38,29 +38,30 @@ const char* cudaGetErrorString(cudaError_t) { return "stub"; }
 static void py_puff_advantage_cpu(
         long long values_ptr, long long rewards_ptr,
         long long dones_ptr, long long importance_ptr,
-        long long advantages_ptr,
+        long long advantages_ptr, long long bootstrap_values_ptr,
         int num_steps, int horizon,
         float gamma, float lambda, float rho_clip, float c_clip) {
     const float* values = (const float*)values_ptr;
     const float* rewards = (const float*)rewards_ptr;
     const float* dones = (const float*)dones_ptr;
     const float* importance = (const float*)importance_ptr;
+    const float* bootstrap_values = (const float*)bootstrap_values_ptr;
     float* advantages = (float*)advantages_ptr;
     for (int row = 0; row < num_steps; row++) {
         int off = row * horizon;
         float lastpufferlam = 0;
-        for (int t = horizon - 2; t >= 0; t--) {
-            int t_next = t + 1;
-            float nextnonterminal = 1.0f - dones[off + t_next];
+        float next_value = bootstrap_values[row];
+        for (int t = horizon - 1; t >= 0; t--) {
+            float nextnonterminal = 1.0f - dones[off + t];
             float imp = importance[off + t];
             float rho_t = imp < rho_clip ? imp : rho_clip;
             float c_t = imp < c_clip ? imp : c_clip;
-            float r_nxt = rewards[off + t_next];
+            float reward = rewards[off + t];
             float v = values[off + t];
-            float v_nxt = values[off + t_next];
-            float delta = rho_t * r_nxt + gamma * v_nxt * nextnonterminal - v;
+            float delta = rho_t * (reward + gamma * next_value * nextnonterminal - v);
             lastpufferlam = delta + gamma * lambda * c_t * lastpufferlam * nextnonterminal;
             advantages[off + t] = lastpufferlam;
+            next_value = v;
         }
     }
 }

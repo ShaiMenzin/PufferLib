@@ -262,16 +262,18 @@ int py_num_envs(py::object pufferl_obj) {
 void py_puff_advantage(
         long long values_ptr, long long rewards_ptr,
         long long dones_ptr,  long long importance_ptr,
-        long long advantages_ptr,
+        long long advantages_ptr, long long bootstrap_values_ptr,
         int num_steps, int horizon,
         float gamma, float lambda, float rho_clip, float c_clip) {
     constexpr int N = 16 / sizeof(precision_t);
     int blocks = grid_size(num_steps);
-    auto kernel = (horizon % N == 0) ? puff_advantage : puff_advantage_scalar;
+    auto kernel = (horizon % N == 0)
+        ? puff_advantage_aligned
+        : puff_advantage_aligned_scalar;
     kernel<<<blocks, 256>>>(
         (const precision_t*)values_ptr, (const precision_t*)rewards_ptr,
         (const precision_t*)dones_ptr,  (const precision_t*)importance_ptr,
-        (precision_t*)advantages_ptr,
+        (precision_t*)advantages_ptr, (const precision_t*)bootstrap_values_ptr,
         gamma, lambda, rho_clip, c_clip, num_steps, horizon);
 }
 
