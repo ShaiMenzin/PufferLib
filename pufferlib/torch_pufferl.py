@@ -9,7 +9,6 @@ import os
 import time
 from collections import defaultdict
 
-import numpy as np
 import torch
 import torch.distributed
 from torch.distributions.utils import logits_to_probs
@@ -20,6 +19,7 @@ from pufferlib import _C
 from pufferlib.models import reset_recurrent_state
 from pufferlib.muon import Muon
 from pufferlib.rewards import training_rewards
+from pufferlib.schedules import learning_rate_at_epoch
 
 if _C.precision_bytes != 4:
     raise RuntimeError(
@@ -286,12 +286,8 @@ class PuffeRL:
         anneal_beta = b0 + (1 - b0)*a*self.epoch/self.total_epochs
         self.ratio[:] = 1
 
-        learning_rate = config['learning_rate']
-        if config['anneal_lr'] and self.epoch > 0:
-            lr_ratio = self.epoch / self.total_epochs
-            lr_min = config['learning_rate'] * config['min_lr_ratio']
-            learning_rate = lr_min + 0.5*(learning_rate - lr_min) * (1 + np.cos(np.pi * lr_ratio))
-            self.optimizer.param_groups[0]['lr'] = learning_rate
+        learning_rate = learning_rate_at_epoch(config, self.epoch, self.batch_size)
+        self.optimizer.param_groups[0]['lr'] = learning_rate
 
         # Transpose from rollout writes to minibatch indexing.
         obs = self.observations.transpose(0, 1).contiguous()
