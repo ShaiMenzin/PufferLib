@@ -246,6 +246,7 @@ FusedScanProfile* create_fusedscan(int B, int T, int H) {
     PrecisionTensor combined_t = {.shape = {B, T, 3*H}};
     PrecisionTensor state_t    = {.shape = {B, H}};
     PrecisionTensor input_t    = {.shape = {B, T, H}};
+    PrecisionTensor episode_starts_t = {.shape = {B, T}};
 
     s.out            = {.shape = {B, T, H}};
     s.next_state     = {.shape = {B, H}};
@@ -263,6 +264,7 @@ FusedScanProfile* create_fusedscan(int B, int T, int H) {
     alloc_register(&p->alloc, &combined_t);
     alloc_register(&p->alloc, &state_t);
     alloc_register(&p->alloc, &input_t);
+    alloc_register(&p->alloc, &episode_starts_t);
     alloc_register(&p->alloc, &s.out);
     alloc_register(&p->alloc, &s.next_state);
     alloc_register(&p->alloc, &s.a_star);
@@ -278,6 +280,7 @@ FusedScanProfile* create_fusedscan(int B, int T, int H) {
     s.combined_ptr = combined_t.data;
     s.state_ptr    = state_t.data;
     s.input_ptr    = input_t.data;
+    s.episode_starts_ptr = episode_starts_t.data;
 
     int N_combined = B * T * 3 * H;
     int N_state = B * H;

@@ -28,7 +28,8 @@ typedef PrecisionTensor (*decoder_backward_fn)(void* weights, void* activations,
 typedef PrecisionTensor (*network_forward_fn)(void* weights, PrecisionTensor x,
     PrecisionTensor state, void* activations, cudaStream_t stream);
 typedef PrecisionTensor (*network_forward_train_fn)(void* weights, PrecisionTensor x,
-    PrecisionTensor state, void* activations, cudaStream_t stream);
+    PrecisionTensor state, PrecisionTensor episode_starts, void* activations,
+    cudaStream_t stream);
 typedef PrecisionTensor (*network_backward_fn)(void* weights,
     PrecisionTensor grad, void* activations, cudaStream_t stream);
 
@@ -142,6 +143,7 @@ struct PrefixScan {
     precision_t* combined_ptr = nullptr;
     precision_t* state_ptr = nullptr;
     precision_t* input_ptr = nullptr;  // (B, T, H) original input before projection (for highway gate)
+    precision_t* episode_starts_ptr = nullptr;  // (B, T)
     int B = 0, T = 0, H = 0;
     FloatTensor a_star, s_vals, log_values_buf;
     PrecisionTensor out, next_state;
@@ -161,6 +163,7 @@ __global__ void mingru_scan_forward(PrefixScan scan) {
     const precision_t* __restrict__ combined = scan.combined_ptr;
     const precision_t* __restrict__ state = scan.state_ptr;
     const precision_t* __restrict__ input = scan.input_ptr;
+    const precision_t* __restrict__ episode_starts = scan.episode_starts_ptr;
 
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= B * H) {
@@ -201,6 +204,10 @@ __global__ void mingru_scan_forward(PrefixScan scan) {
     int t_offset = 0;
 
     for (int t = 1; t < T_seq + 1; t++) {
+        if (to_float(episode_starts[b * T_seq + t - 1]) != 0.0f) {
+            a_star = 0.0f;
+            s = -CUDART_INF_F;
+        }
         float hidden_val = to_float(combined_h_base[t_offset]);
         float gate_val = to_float(combined_g_base[t_offset]);
         float proj_val = to_float(combined_p_base[t_offset]);
@@ -247,6 +254,7 @@ __global__ void mingru_scan_backward(PrefixScan scan,
     const precision_t* __restrict__ combined = scan.combined_ptr;
     const precision_t* __restrict__ state = scan.state_ptr;
     const precision_t* __restrict__ input = scan.input_ptr;
+    const precision_t* __restrict__ episode_starts = scan.episode_starts_ptr;
     const float* __restrict__ a_star_buf = scan.a_star.data;
     const float* __restrict__ s_buf = scan.s_vals.data;
     const float* __restrict__ log_values_buf = scan.log_values_buf.data;
@@ -302,6 +310,10 @@ __global__ void mingru_scan_backward(PrefixScan scan,
         for (int i = 0; i < chunk_len; ++i) {
             int t = chunk_start + 1 + i;
             int t_offset = (t - 1) * H3;
+            if (to_float(episode_starts[b * T_seq + t - 1]) != 0.0f) {
+                recomp_a_star = 0.0f;
+                recomp_s = -CUDART_INF_F;
+            }
             float hv = to_float(combined_h_base[t_offset]);
             float gv = to_float(combined_g_base[t_offset]);
 
@@ -348,7 +360,9 @@ __global__ void mingru_scan_backward(PrefixScan scan,
             float grad_log_h = grad_scan_result * scan_result;
             float grad_s = grad_log_h;
 
-            if (t == T_seq) {
+            bool connected_to_next = t == T_seq
+                || to_float(episode_starts[b * T_seq + t]) == 0.0f;
+            if (t == T_seq || !connected_to_next) {
                 acc = grad_s;
             } else {
                 acc = grad_s + acc * __expf(s_t - s_val_next);
@@ -365,7 +379,17 @@ __global__ void mingru_scan_backward(PrefixScan scan,
             grad_combined_h_base[t_offset] = from_float(grad_h);
             grad_combined_g_base[t_offset] = from_float(grad_g);
             grad_combined_p_base[t_offset] = from_float(grad_proj);
+
+            if (to_float(episode_starts[b * T_seq + t - 1]) != 0.0f) {
+                acc = 0.0f;
+                carry_grad_a = 0.0f;
+            }
         }
+    }
+
+    if (to_float(episode_starts[b * T_seq]) != 0.0f) {
+        grad_state[state_idx] = from_float(0.0f);
+        return;
     }
 
     int ckpt_0_idx = buf_base;
@@ -720,7 +744,7 @@ static PrecisionTensor mingru_forward(void* w, PrecisionTensor x, PrecisionTenso
 }
 
 static PrecisionTensor mingru_forward_train(void* w, PrecisionTensor x, PrecisionTensor state,
-        void* activations, cudaStream_t stream) {
+        PrecisionTensor episode_starts, void* activations, cudaStream_t stream) {
     MinGRUWeights* m = (MinGRUWeights*)w;
     MinGRUActivations* a = (MinGRUActivations*)activations;
     int B = x.shape[0];
@@ -731,6 +755,7 @@ static PrecisionTensor mingru_forward_train(void* w, PrecisionTensor x, Precisio
         a->scan_bufs[i].combined_ptr = a->combined_bufs[i].data;
         a->scan_bufs[i].state_ptr = state_i.data;
         a->scan_bufs[i].input_ptr = a->saved_inputs[i].data;
+        a->scan_bufs[i].episode_starts_ptr = episode_starts.data;
         mingru_scan_forward<<<grid_size(B*m->hidden), BLOCK_SIZE, 0, stream>>>(a->scan_bufs[i]);
         x = a->scan_bufs[i].out;
     }
@@ -788,10 +813,12 @@ PrecisionTensor policy_forward(Policy* p, PolicyWeights& w, PolicyActivations& a
 }
 
 PrecisionTensor policy_forward_train(Policy* p, PolicyWeights& w, PolicyActivations& activations,
-        PrecisionTensor x, PrecisionTensor state, cudaStream_t stream) {
+        PrecisionTensor x, PrecisionTensor state, PrecisionTensor episode_starts,
+        cudaStream_t stream) {
     int B = x.shape[0], TT = x.shape[1];
     PrecisionTensor h = p->encoder.forward(w.encoder, activations.encoder, *puf_squeeze(&x, 0), stream);
-    h = p->network.forward_train(w.network, *puf_unsqueeze(&h, 0, B, TT), state, activations.network, stream);
+    h = p->network.forward_train(w.network, *puf_unsqueeze(&h, 0, B, TT),
+        state, episode_starts, activations.network, stream);
     PrecisionTensor dec_out = p->decoder.forward(w.decoder, activations.decoder, *puf_squeeze(&h, 0), stream);
     return *puf_unsqueeze(&dec_out, 0, B, TT);
 }

@@ -94,6 +94,7 @@ void register_rollout_buffers(RolloutBuf& bufs, Allocator* alloc, int T, int B, 
 // training to perform several (though not all) ops in contiguous memory
 struct TrainGraph {
     PrecisionTensor mb_state;       // (layers, B, hidden)
+    PrecisionTensor mb_episode_starts; // (B, T)
     PrecisionTensor mb_obs;         // (B, T, input_size)
     PrecisionTensor mb_actions;     // (B, T, num_atns)
     PrecisionTensor mb_logprobs;    // (B, T)
@@ -110,6 +111,7 @@ void register_train_buffers(TrainGraph& bufs, Allocator* alloc, int B, int T, in
         int hidden_size, int num_atns, int num_layers, int mask_size) {
     bufs = (TrainGraph){
         .mb_state =         {.shape = {num_layers, B, hidden_size}},
+        .mb_episode_starts = {.shape = {B, T}},
         .mb_obs =           {.shape = {B, T, input_size}},
         .mb_actions =       {.shape = {B, T, num_atns}},
         .mb_logprobs =      {.shape = {B, T}},
@@ -123,6 +125,7 @@ void register_train_buffers(TrainGraph& bufs, Allocator* alloc, int B, int T, in
     };
     alloc_register(alloc, &bufs.mb_obs);
     alloc_register(alloc, &bufs.mb_state);
+    alloc_register(alloc, &bufs.mb_episode_starts);
     alloc_register(alloc, &bufs.mb_actions);
     alloc_register(alloc, &bufs.mb_logprobs);
     alloc_register(alloc, &bufs.mb_advantages);
@@ -349,6 +352,7 @@ typedef struct {
     bool is_continuous;  // True if all action dimensions are continuous (size==1)
     PrecisionTensor* buffer_states;  // Per-buffer states for contiguous access
     PolicyActivations* buffer_activations;  // Per-buffer inference activations
+    PrecisionTensor rollout_states;  // Rollout-start states (layers, agents, hidden)
     RolloutBuf rollouts;
     RolloutBuf train_rollouts;  // Pre-allocated transposed copy for train_impl
     EnvBuf env;
@@ -624,6 +628,36 @@ __global__ void sample_logits(
     rng_states[idx] = state;
 }
 
+__global__ void reset_recurrent_state_kernel(
+        precision_t* state, const float* episode_starts,
+        int layers, int state_batch, int batch, int hidden) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int n = layers * batch * hidden;
+    if (idx >= n) return;
+    int layer = idx / (batch * hidden);
+    int rem = idx % (batch * hidden);
+    int agent = rem / hidden;
+    if (episode_starts[agent] != 0.0f) {
+        int state_idx = layer * state_batch * hidden + rem;
+        state[state_idx] = from_float(0.0f);
+    }
+}
+
+__global__ void capture_rollout_state_kernel(
+        precision_t* rollout_state, const precision_t* state,
+        int layers, int total_agents, int state_batch,
+        int agent_start, int batch, int hidden) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int n = layers * batch * hidden;
+    if (idx >= n) return;
+    int layer = idx / (batch * hidden);
+    int rem = idx % (batch * hidden);
+    int agent = rem / hidden;
+    int feature = rem % hidden;
+    rollout_state[(layer * total_agents + agent_start + agent) * hidden + feature]
+        = state[(layer * state_batch + agent) * hidden + feature];
+}
+
 // Single step rollout forward pass. Called by each environment worker in their
 // own buffer thread. This operation is cudagraphed.
 extern "C" void net_callback_wrapper(void* ctx, int buf, int t) {
@@ -720,6 +754,27 @@ extern "C" void net_callback_wrapper(void* ctx, int buf, int t) {
         if (rollouts.action_mask.data != nullptr) {
             mask_b = puf_slice(rollouts.action_mask, t, sub_start, bank_size);
             mask_stride_b = mask_stride;
+        }
+
+        int state_batch = s_bank->shape[1];
+        int state_n = p_bank->network.num_layers * bank_size * p_bank->network.hidden;
+        reset_recurrent_state_kernel<<<grid_size(state_n), BLOCK_SIZE, 0, stream>>>(
+            s_bank->data,
+            env.terminals.data + sub_start,
+            p_bank->network.num_layers,
+            state_batch,
+            bank_size,
+            p_bank->network.hidden);
+        if (b == 0 && t == 0) {
+            capture_rollout_state_kernel<<<grid_size(state_n), BLOCK_SIZE, 0, stream>>>(
+                pufferl->rollout_states.data,
+                s_bank->data,
+                p_bank->network.num_layers,
+                hypers.total_agents,
+                state_batch,
+                sub_start,
+                bank_size,
+                p_bank->network.hidden);
         }
 
         PrecisionTensor dec_puf = policy_forward(p_bank, *w_bank, *a_bank, obs_b, *s_bank, stream);
@@ -1569,7 +1624,8 @@ __device__ __forceinline__ void copy_values_adv_returns(
     }
 }
 
-__global__ void select_copy(RolloutBuf rollouts, TrainGraph graph,
+__global__ void select_copy(RolloutBuf rollouts, PrecisionTensor rollout_states,
+        TrainGraph graph,
         const int* __restrict__ idx, const precision_t* __restrict__ advantages,
         const float* __restrict__ mb_prio) {
     int mb = blockIdx.x;
@@ -1603,6 +1659,24 @@ __global__ void select_copy(RolloutBuf rollouts, TrainGraph graph,
         }
         break;
     case 5:
+        copy_bytes((const char*)rollouts.terminals.data,
+                   (char*)graph.mb_episode_starts.data,
+                   src_row, mb, horizon * sizeof(precision_t));
+        break;
+    case 6: {
+        int layers = rollout_states.shape[0];
+        int total_agents = rollout_states.shape[1];
+        int hidden = rollout_states.shape[2];
+        int minibatch = graph.mb_state.shape[1];
+        for (int i = threadIdx.x; i < layers * hidden; i += blockDim.x) {
+            int layer = i / hidden;
+            int feature = i % hidden;
+            graph.mb_state.data[(layer * minibatch + mb) * hidden + feature]
+                = rollout_states.data[(layer * total_agents + src_row) * hidden + feature];
+        }
+        break;
+    }
+    case 7:
         if (graph.mb_action_mask.data != nullptr) {
             int mask_row_bytes = (numel(rollouts.action_mask.shape)
                 / rollouts.action_mask.shape[0]) * sizeof(precision_t);
@@ -1725,14 +1799,13 @@ void train_impl(PuffeRL& pufferl) {
         profile_end(hypers.profile);
 
         profile_begin("train_select_and_copy", hypers.profile);
-        if (hypers.reset_state) puf_zero(&graph.mb_state, train_stream);
         {
             RolloutBuf sel_src = rollouts;
             sel_src.values = rollouts.values;
             int mb_segs = pufferl.prio_bufs.idx.shape[0];
-            int channels = (graph.mb_action_mask.data != nullptr) ? 6 : 5;
+            int channels = (graph.mb_action_mask.data != nullptr) ? 8 : 7;
             select_copy<<<dim3(mb_segs, channels), SELECT_COPY_THREADS, 0, train_stream>>>(
-                sel_src, graph, pufferl.prio_bufs.idx.data,
+                sel_src, pufferl.rollout_states, graph, pufferl.prio_bufs.idx.data,
                 advantages_puf.data, pufferl.prio_bufs.mb_prio.data);
         }
         profile_end(hypers.profile);
@@ -1751,7 +1824,9 @@ void train_impl(PuffeRL& pufferl) {
             cudaStream_t stream = train_stream;
             PrecisionTensor obs_puf = graph.mb_obs;
             PrecisionTensor state_puf = graph.mb_state;
-            PrecisionTensor dec_puf = policy_forward_train(&pufferl.policy, pufferl.weights, pufferl.train_activations, obs_puf, state_puf, stream);
+            PrecisionTensor dec_puf = policy_forward_train(
+                &pufferl.policy, pufferl.weights, pufferl.train_activations,
+                obs_puf, state_puf, graph.mb_episode_starts, stream);
             DecoderWeights* dw_train = (DecoderWeights*)pufferl.weights.decoder;
             PrecisionTensor p_logstd;
             if (dw_train->continuous) {
@@ -2155,6 +2230,10 @@ std::unique_ptr<PuffeRL> create_pufferl_impl(HypersT& hypers,
         };
         alloc_register(acts, &pufferl->buffer_states[i]);
     }
+    pufferl->rollout_states = {
+        .shape = {num_layers, total_agents, hidden_size},
+    };
+    alloc_register(acts, &pufferl->rollout_states);
     int mask_size = pufferl->vec->action_mask_size;
     register_rollout_buffers(pufferl->rollouts,
         acts, horizon, total_agents, input_size, num_action_heads, mask_size);
@@ -2334,6 +2413,14 @@ std::unique_ptr<PuffeRL> create_pufferl_impl(HypersT& hypers,
         }
     }
 
+    for (int i = 0; i < num_buffers; i++) {
+        puf_zero(&pufferl->buffer_states[i], pufferl->default_stream);
+    }
+    for (int b = 0; b < pufferl->num_frozen_banks; b++) {
+        for (int i = 0; i < num_buffers; i++) {
+            puf_zero(&pufferl->frozen_banks[b].buffer_states[i], pufferl->default_stream);
+        }
+    }
     create_static_threads(vec, hypers.num_threads, horizon, pufferl.get(),
         net_callback_wrapper, thread_init_wrapper);
     static_vec_reset(vec);
