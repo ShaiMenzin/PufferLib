@@ -510,6 +510,10 @@ PYBIND11_MODULE(_C, m) {
     m.attr("precision_bytes") = (int)sizeof(precision_t);
     m.attr("env_name") = PUFFER_STRINGIFY(ENV_NAME);
     m.attr("gpu") = 1;
+    m.attr("act_sizes") = std::vector<int>(
+        get_act_sizes(),
+        get_act_sizes() + get_num_act_sizes()
+    );
 
     // Core functions
     m.def("log", &puf_log);
