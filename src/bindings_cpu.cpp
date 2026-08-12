@@ -32,7 +32,7 @@ const char* cudaGetErrorString(cudaError_t) { return "stub"; }
 }
 
 // ============================================================================
-// CPU advantage (same as puff_advantage_row_scalar but plain C++)
+// CPU advantage (same transition-aligned calculation as the CUDA kernels)
 // ============================================================================
 
 static void py_puff_advantage_cpu(

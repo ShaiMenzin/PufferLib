@@ -53,8 +53,9 @@ struct RolloutBuf {
     PrecisionTensor actions;       // (horizon, agents, num_atns)
     PrecisionTensor values;        // (horizon, agents)
     PrecisionTensor logprobs;      // ...
-    PrecisionTensor rewards;
-    PrecisionTensor terminals;
+    PrecisionTensor rewards;       // Produced by the action at the same index
+    PrecisionTensor terminals;     // Transition boundary after the indexed action
+    PrecisionTensor episode_starts; // Boundary before the indexed observation
     PrecisionTensor ratio;
     PrecisionTensor importance;
     PrecisionTensor action_mask;   // (horizon, agents, mask_size); .data=nullptr when env opts out
@@ -71,6 +72,7 @@ void register_rollout_buffers(RolloutBuf& bufs, Allocator* alloc, int T, int B, 
         .logprobs     = {.shape = {T, B}},
         .rewards      = {.shape = {T, B}},
         .terminals    = {.shape = {T, B}},
+        .episode_starts = {.shape = {T, B}},
         .ratio        = {.shape = {T, B}},
         .importance   = {.shape = {T, B}},
         .action_mask  = {},
@@ -81,6 +83,7 @@ void register_rollout_buffers(RolloutBuf& bufs, Allocator* alloc, int T, int B, 
     alloc_register(alloc, &bufs.logprobs);
     alloc_register(alloc, &bufs.rewards);
     alloc_register(alloc, &bufs.terminals);
+    alloc_register(alloc, &bufs.episode_starts);
     alloc_register(alloc, &bufs.ratio);
     alloc_register(alloc, &bufs.importance);
     if (mask_size > 0) {
@@ -332,6 +335,7 @@ typedef struct {
     PrecisionTensor param_puf;
     FloatTensor master_weights;
     PrecisionTensor* buffer_states;         // [num_buffers]
+    PrecisionTensor* bootstrap_states;      // [num_buffers]
     PolicyActivations* buffer_activations;  // [num_buffers]
     int slice_size;  // # agents per buffer this bank owns; sets activation/state batch dim
     int hidden_size;
@@ -351,14 +355,17 @@ typedef struct {
     HypersT hypers;
     bool is_continuous;  // True if all action dimensions are continuous (size==1)
     PrecisionTensor* buffer_states;  // Per-buffer states for contiguous access
+    PrecisionTensor* bootstrap_states;  // Per-buffer scratch states for value bootstrapping
     PolicyActivations* buffer_activations;  // Per-buffer inference activations
     PrecisionTensor rollout_states;  // Rollout-start states (layers, agents, hidden)
+    PrecisionTensor bootstrap_observations;  // Final observations (agents, input_size)
+    PrecisionTensor bootstrap_values;  // Final state values (agents,)
     RolloutBuf rollouts;
     RolloutBuf train_rollouts;  // Pre-allocated transposed copy for train_impl
     EnvBuf env;
     TrainGraph train_buf;
     PrecisionTensor advantages_puf;  // Pre-allocated for train_impl (B, T)
-    cudaGraphExec_t* fused_rollout_cudagraphs;  // [horizon][num_buffers]
+    cudaGraphExec_t* fused_rollout_cudagraphs;  // [horizon + 1][num_buffers]
     cudaGraphExec_t train_cudagraph;
     cudaStream_t* streams;  // per-buffer raw CUDA streams
     cudaStream_t default_stream;  // main-thread stream (captured once at init)
@@ -658,8 +665,17 @@ __global__ void capture_rollout_state_kernel(
         = state[(layer * state_batch + agent) * hidden + feature];
 }
 
-// Single step rollout forward pass. Called by each environment worker in their
-// own buffer thread. This operation is cudagraphed.
+__global__ void capture_bootstrap_values_kernel(
+        precision_t* bootstrap_values, const precision_t* decoder_output,
+        int batch, int stride) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < batch) {
+        bootstrap_values[idx] = decoder_output[idx * stride + stride - 1];
+    }
+}
+
+// Rollout callback. Action steps are followed by a final transition/bootstrap
+// phase at t == horizon. Each phase is cudagraphed per environment buffer.
 extern "C" void net_callback_wrapper(void* ctx, int buf, int t) {
     PuffeRL* pufferl = (PuffeRL*)ctx;
     HypersT& hypers = pufferl->hypers;
@@ -686,20 +702,110 @@ extern "C" void net_callback_wrapper(void* ctx, int buf, int t) {
     int start = buf * block_size;
     cudaStream_t stream = current_stream;
 
-    // Copy observations, rewards, terminals from GPU env buffers to rollout buffer
+    if (t > 0) {
+        int transition_t = t - 1;
+        PrecisionTensor rew_dst = puf_slice(
+            rollouts.rewards, transition_t, start, block_size);
+        PrecisionTensor term_dst = puf_slice(
+            rollouts.terminals, transition_t, start, block_size);
+        cast<<<grid_size(block_size), BLOCK_SIZE, 0, stream>>>(
+            rew_dst.data, env.rewards.data + start, block_size);
+        cast<<<grid_size(block_size), BLOCK_SIZE, 0, stream>>>(
+            term_dst.data, env.terminals.data + start, block_size);
+    }
+
+    if (t == hypers.horizon) {
+        int obs_size = env.obs.shape[1];
+        PrecisionTensor bootstrap_obs = {
+            .data = pufferl->bootstrap_observations.data + (long)start * obs_size,
+            .shape = {block_size, obs_size},
+        };
+        cast_dispatch(
+            bootstrap_obs.data,
+            env.obs.data + (long)start * obs_size,
+            block_size * obs_size,
+            stream);
+
+        int num_banks = 1 + pufferl->num_frozen_banks;
+        for (int b = 0; b < num_banks; b++) {
+            int bank_off = pufferl->bank_layout ? pufferl->bank_layout[b] : 0;
+            int bank_end = pufferl->bank_layout
+                ? pufferl->bank_layout[b + 1] : block_size;
+            int bank_size = bank_end - bank_off;
+            if (bank_size == 0) continue;
+
+            Policy* p_bank;
+            PolicyWeights* w_bank;
+            PolicyActivations* a_bank;
+            PrecisionTensor* state_bank;
+            PrecisionTensor* bootstrap_state_bank;
+            if (b == 0) {
+                p_bank = &pufferl->policy;
+                w_bank = &pufferl->weights;
+                a_bank = &pufferl->buffer_activations[buf];
+                state_bank = &pufferl->buffer_states[buf];
+                bootstrap_state_bank = &pufferl->bootstrap_states[buf];
+            } else {
+                WeightBank* fb = &pufferl->frozen_banks[b - 1];
+                p_bank = &fb->policy;
+                w_bank = &fb->weights;
+                a_bank = &fb->buffer_activations[buf];
+                state_bank = &fb->buffer_states[buf];
+                bootstrap_state_bank = &fb->bootstrap_states[buf];
+            }
+
+            int sub_start = start + bank_off;
+            PrecisionTensor obs_bank = {
+                .data = pufferl->bootstrap_observations.data
+                    + (long)sub_start * obs_size,
+                .shape = {bank_size, obs_size},
+            };
+            puf_copy(bootstrap_state_bank, state_bank, stream);
+            int state_batch = bootstrap_state_bank->shape[1];
+            int state_n = p_bank->network.num_layers
+                * bank_size * p_bank->network.hidden;
+            reset_recurrent_state_kernel<<<grid_size(state_n), BLOCK_SIZE, 0, stream>>>(
+                bootstrap_state_bank->data,
+                env.terminals.data + sub_start,
+                p_bank->network.num_layers,
+                state_batch,
+                bank_size,
+                p_bank->network.hidden);
+            PrecisionTensor decoder_output = policy_forward(
+                p_bank, *w_bank, *a_bank, obs_bank, *bootstrap_state_bank, stream);
+            capture_bootstrap_values_kernel<<<grid_size(bank_size), BLOCK_SIZE, 0, stream>>>(
+                pufferl->bootstrap_values.data + sub_start,
+                decoder_output.data,
+                bank_size,
+                decoder_output.shape[1]);
+        }
+
+        if (capturing) {
+            cudaGraph_t captured_graph;
+            assert(cudaStreamEndCapture(current_stream, &captured_graph) == cudaSuccess
+                    && "cudaStreamEndCapture failed");
+            assert(cudaGraphInstantiate(
+                    &pufferl->fused_rollout_cudagraphs[graph], captured_graph, 0) == cudaSuccess
+                    && "cudaGraphInstantiate failed");
+            assert(cudaGraphDestroy(captured_graph) == cudaSuccess
+                    && "cudaGraphDestroy failed");
+            cudaDeviceSynchronize();
+        }
+        profile_end(hypers.profile);
+        return;
+    }
+
+    // Copy the state used to select this action and its episode boundary.
     OBS_TENSOR_T& obs_env = env.obs;
     int n = block_size * obs_env.shape[1];
     PrecisionTensor obs_dst = puf_slice(rollouts.observations, t, start, block_size);
     cast_dispatch(obs_dst.data, obs_env.data + (long)start*obs_env.shape[1], n, stream);
 
-    PrecisionTensor rew_dst = puf_slice(rollouts.rewards, t, start, block_size);
     n = block_size;
+    PrecisionTensor episode_start_dst = puf_slice(
+        rollouts.episode_starts, t, start, block_size);
     cast<<<grid_size(n), BLOCK_SIZE, 0, stream>>>(
-        rew_dst.data, env.rewards.data + start, n);
-
-    PrecisionTensor term_dst = puf_slice(rollouts.terminals, t, start, block_size);
-    cast<<<grid_size(n), BLOCK_SIZE, 0, stream>>>(
-        term_dst.data, env.terminals.data + start, n);
+        episode_start_dst.data, env.terminals.data + start, n);
 
     // Copy action mask from env into rollout buffer (if env opted in)
     PrecisionTensor mask_slice = {};
@@ -1367,26 +1473,6 @@ void prio_replay_cuda(PrecisionTensor& advantages, float prio_alpha,
 
 // Experience the puffer advantage! Generalized advantage estimation + V-Trace
 // importance sampling correction in a single streamlined operation
-__device__ void puff_advantage_row_scalar(
-        const precision_t* values, const precision_t* rewards, const precision_t* dones,
-        const precision_t* importance, precision_t* advantages, float gamma, float lambda,
-        float rho_clip, float c_clip, int horizon) {
-    float lastpufferlam = 0;
-    for (int t = horizon-2; t >= 0; t--) {
-        int t_next = t + 1;
-        float nextnonterminal = 1.0f - to_float(dones[t_next]);
-        float imp = to_float(importance[t]);
-        float rho_t = fminf(imp, rho_clip);
-        float c_t = fminf(imp, c_clip);
-        float r_nxt = to_float(rewards[t_next]);
-        float v = to_float(values[t]);
-        float v_nxt = to_float(values[t_next]);
-        float delta = rho_t*r_nxt + gamma*v_nxt*nextnonterminal - v;
-        lastpufferlam = delta + gamma*lambda*c_t*lastpufferlam*nextnonterminal;
-        advantages[t] = from_float(lastpufferlam);
-    }
-}
-
 // These loading fns just optimize bandwidth for advantage since we call it on all
 // the data every minibatch. This should change in 5.0
 __device__ __forceinline__ void adv_vec_load(const float* ptr, float* out) {
@@ -1414,72 +1500,6 @@ __device__ __forceinline__ void adv_vec_store(__nv_bfloat16* ptr, const float* v
     #pragma unroll
     for (int i = 0; i < 8; i++) tmp[i] = __float2bfloat16(vals[i]);
     *reinterpret_cast<uint4*>(ptr) = *reinterpret_cast<const uint4*>(tmp);
-}
-
-__device__ __forceinline__ void puff_advantage_row_vec(
-        const precision_t* values, const precision_t* rewards, const precision_t* dones,
-        const precision_t* importance, precision_t* advantages, float gamma, float lambda,
-        float rho_clip, float c_clip, int horizon) {
-    constexpr int N = 16 / sizeof(precision_t);
-
-    float lastpufferlam = 0.0f;
-    int num_chunks = horizon / N;
-
-    float next_value = to_float(values[horizon - 1]);
-    float next_done = to_float(dones[horizon - 1]);
-    float next_reward = to_float(rewards[horizon - 1]);
-
-    for (int chunk = num_chunks - 1; chunk >= 0; chunk--) {
-        int base = chunk * N;
-
-        float v[N], r[N], d[N], imp[N];
-        adv_vec_load(values + base, v);
-        adv_vec_load(rewards + base, r);
-        adv_vec_load(dones + base, d);
-        adv_vec_load(importance + base, imp);
-
-        float adv[N] = {0};
-        int start_idx = (chunk == num_chunks - 1) ? (N - 2) : (N - 1);
-
-        #pragma unroll
-        for (int i = start_idx; i >= 0; i--) {
-            float nextnonterminal = 1.0f - next_done;
-            float rho_t = fminf(imp[i], rho_clip);
-            float c_t = fminf(imp[i], c_clip);
-            float delta = rho_t * (next_reward + gamma * next_value * nextnonterminal - v[i]);
-            lastpufferlam = delta + gamma * lambda * c_t * lastpufferlam * nextnonterminal;
-            adv[i] = lastpufferlam;
-            next_value = v[i];
-            next_done = d[i];
-            next_reward = r[i];
-        }
-
-        adv_vec_store(advantages + base, adv);
-    }
-}
-
-__global__ void puff_advantage(const precision_t* values, const precision_t* rewards,
-        const precision_t* dones, const precision_t* importance, precision_t* advantages, float gamma,
-        float lambda, float rho_clip, float c_clip, int num_steps, int horizon) {
-    int row = blockIdx.x*blockDim.x + threadIdx.x;
-    if (row >= num_steps) {
-        return;
-    }
-    int offset = row*horizon;
-    puff_advantage_row_vec(values + offset, rewards + offset, dones + offset,
-        importance + offset, advantages + offset, gamma, lambda, rho_clip, c_clip, horizon);
-}
-
-__global__ void puff_advantage_scalar(const precision_t* values, const precision_t* rewards,
-        const precision_t* dones, const precision_t* importance, precision_t* advantages, float gamma,
-        float lambda, float rho_clip, float c_clip, int num_steps, int horizon) {
-    int row = blockIdx.x*blockDim.x + threadIdx.x;
-    if (row >= num_steps) {
-        return;
-    }
-    int offset = row*horizon;
-    puff_advantage_row_scalar(values + offset, rewards + offset, dones + offset,
-        importance + offset, advantages + offset, gamma, lambda, rho_clip, c_clip, horizon);
 }
 
 __device__ __forceinline__ void puff_advantage_aligned_row_vec(
@@ -1559,14 +1579,18 @@ __global__ void puff_advantage_aligned_scalar(
 
 void puff_advantage_cuda(PrecisionTensor& values, PrecisionTensor& rewards,
         PrecisionTensor& dones, PrecisionTensor& importance, PrecisionTensor& advantages,
-        float gamma, float lambda, float rho_clip, float c_clip, cudaStream_t stream) {
+        PrecisionTensor& bootstrap_values, float gamma, float lambda,
+        float rho_clip, float c_clip, cudaStream_t stream) {
     int num_steps = values.shape[0], horizon = values.shape[1];
     int blocks = grid_size(num_steps);
     constexpr int N = 16 / sizeof(precision_t);
-    auto kernel = (horizon % N == 0) ? puff_advantage : puff_advantage_scalar;
+    auto kernel = (horizon % N == 0)
+        ? puff_advantage_aligned
+        : puff_advantage_aligned_scalar;
     kernel<<<blocks, 256, 0, stream>>>(
         values.data, rewards.data, dones.data, importance.data,
-        advantages.data, gamma, lambda, rho_clip, c_clip, num_steps, horizon);
+        advantages.data, bootstrap_values.data,
+        gamma, lambda, rho_clip, c_clip, num_steps, horizon);
 }
 
 // Zero advantages on frozen-bank rows so prio_replay never samples them. Frozen
@@ -1659,7 +1683,7 @@ __global__ void select_copy(RolloutBuf rollouts, PrecisionTensor rollout_states,
         }
         break;
     case 5:
-        copy_bytes((const char*)rollouts.terminals.data,
+        copy_bytes((const char*)rollouts.episode_starts.data,
                    (char*)graph.mb_episode_starts.data,
                    src_row, mb, horizon * sizeof(precision_t));
         break;
@@ -1721,6 +1745,8 @@ void train_impl(PuffeRL& pufferl) {
     transpose_102<<<grid_size(T*B), BLOCK_SIZE, 0, train_stream>>>(
         rollouts.terminals.data, src.terminals.data, T, B, 1);
     transpose_102<<<grid_size(T*B), BLOCK_SIZE, 0, train_stream>>>(
+        rollouts.episode_starts.data, src.episode_starts.data, T, B, 1);
+    transpose_102<<<grid_size(T*B), BLOCK_SIZE, 0, train_stream>>>(
         rollouts.ratio.data, src.ratio.data, T, B, 1);
     transpose_102<<<grid_size(T*B), BLOCK_SIZE, 0, train_stream>>>(
         rollouts.values.data, src.values.data, T, B, 1);
@@ -1729,10 +1755,6 @@ void train_impl(PuffeRL& pufferl) {
         transpose_102<<<grid_size(T*B*mask_size), BLOCK_SIZE, 0, train_stream>>>(
             rollouts.action_mask.data, src.action_mask.data, T, B, mask_size);
     }
-
-    // We hard-clamp rewards to -1, 1. Our envs are mostly designed to respect this range
-    clamp_precision_kernel<<<grid_size(numel(rollouts.rewards.shape)), BLOCK_SIZE, 0, train_stream>>>(
-        rollouts.rewards.data, -1.0f, 1.0f, numel(rollouts.rewards.shape));
 
     // Set importance weights to 1.0
     fill_precision_kernel<<<grid_size(numel(rollouts.ratio.shape)), BLOCK_SIZE, 0, train_stream>>>(
@@ -1781,7 +1803,8 @@ void train_impl(PuffeRL& pufferl) {
 
         profile_begin("compute_advantage", hypers.profile);
         puff_advantage_cuda(rollouts.values, rollouts.rewards, rollouts.terminals,
-            rollouts.ratio, advantages_puf, hypers.gamma, hypers.gae_lambda,
+            rollouts.ratio, advantages_puf, pufferl.bootstrap_values,
+            hypers.gamma, hypers.gae_lambda,
             hypers.vtrace_rho_clip, hypers.vtrace_c_clip, train_stream);
         if (pufferl.num_frozen_banks > 0 && pufferl.bank_layout != NULL) {
             int apb = hypers.total_agents / hypers.num_buffers;
@@ -1982,10 +2005,13 @@ static void weight_bank_create_for_pufferl(WeightBank* bank, PuffeRL* pufferl,
     bank->weights = policy_weights_create(&bank->policy, params);
     bank->buffer_activations = (PolicyActivations*)calloc(num_buffers, sizeof(PolicyActivations));
     bank->buffer_states = (PrecisionTensor*)calloc(num_buffers, sizeof(PrecisionTensor));
+    bank->bootstrap_states = (PrecisionTensor*)calloc(num_buffers, sizeof(PrecisionTensor));
     for (int i = 0; i < num_buffers; i++) {
         bank->buffer_activations[i] = policy_reg_rollout(&bank->policy, bank->weights, acts, slice_size);
         bank->buffer_states[i] = {.shape = {num_layers, slice_size, hidden_size}};
+        bank->bootstrap_states[i] = {.shape = {num_layers, slice_size, hidden_size}};
         alloc_register(acts, &bank->buffer_states[i]);
+        alloc_register(acts, &bank->bootstrap_states[i]);
     }
 
     alloc_create(params);
@@ -2013,6 +2039,7 @@ static void weight_bank_destroy(WeightBank* bank, PuffeRL* pufferl) {
         free(bank->buffer_activations);
     }
     free(bank->buffer_states);
+    free(bank->bootstrap_states);
     alloc_free(&bank->params_alloc);
     alloc_free(&bank->acts_alloc);
     if (USE_BF16 && bank->master_weights.data != NULL) {
@@ -2222,18 +2249,31 @@ std::unique_ptr<PuffeRL> create_pufferl_impl(HypersT& hypers,
     pufferl->train_activations = policy_reg_train(&pufferl->policy, pufferl->weights, acts, grads, B_TT);
     pufferl->buffer_activations = (PolicyActivations*)calloc(num_buffers, sizeof(PolicyActivations));
     pufferl->buffer_states = (PrecisionTensor*)calloc(num_buffers, sizeof(PrecisionTensor));
+    pufferl->bootstrap_states = (PrecisionTensor*)calloc(num_buffers, sizeof(PrecisionTensor));
     for (int i = 0; i < num_buffers; i++) {
         pufferl->buffer_activations[i] = policy_reg_rollout(
             &pufferl->policy, pufferl->weights, acts, inf_batch);
         pufferl->buffer_states[i] = {
             .shape = {num_layers, batch, hidden_size},
         };
+        pufferl->bootstrap_states[i] = {
+            .shape = {num_layers, batch, hidden_size},
+        };
         alloc_register(acts, &pufferl->buffer_states[i]);
+        alloc_register(acts, &pufferl->bootstrap_states[i]);
     }
     pufferl->rollout_states = {
         .shape = {num_layers, total_agents, hidden_size},
     };
     alloc_register(acts, &pufferl->rollout_states);
+    pufferl->bootstrap_observations = {
+        .shape = {total_agents, input_size},
+    };
+    alloc_register(acts, &pufferl->bootstrap_observations);
+    pufferl->bootstrap_values = {
+        .shape = {total_agents},
+    };
+    alloc_register(acts, &pufferl->bootstrap_values);
     int mask_size = pufferl->vec->action_mask_size;
     register_rollout_buffers(pufferl->rollouts,
         acts, horizon, total_agents, input_size, num_action_heads, mask_size);
@@ -2335,7 +2375,8 @@ std::unique_ptr<PuffeRL> create_pufferl_impl(HypersT& hypers,
 
     // Cudagraph rolluts and entire training step
     if (hypers.cudagraphs >= 0) {
-        pufferl->fused_rollout_cudagraphs = (cudaGraphExec_t*)calloc(horizon*num_buffers, sizeof(cudaGraphExec_t));
+        pufferl->fused_rollout_cudagraphs = (cudaGraphExec_t*)calloc(
+            (horizon + 1) * num_buffers, sizeof(cudaGraphExec_t));
         pufferl->train_warmup = 0;
 
         // Snapshot weights + optimizer state before init-time capture
@@ -2362,7 +2403,7 @@ std::unique_ptr<PuffeRL> create_pufferl_impl(HypersT& hypers,
         pufferl->default_stream = warmup_stream;
 
         for (pufferl->epoch = 0; pufferl->epoch <= hypers.cudagraphs; pufferl->epoch++) {
-            for (int i = 0; i < num_buffers * horizon; ++i) {
+            for (int i = 0; i < num_buffers * (horizon + 1); ++i) {
                 int buf = i % num_buffers;
                 tl_stream = pufferl->streams[buf];
                 net_callback_wrapper(pufferl.get(), buf, i / num_buffers);
@@ -2445,7 +2486,9 @@ void close_impl(PuffeRL& pufferl) {
     }
 
     cudaGraphExecDestroy(pufferl.train_cudagraph);
-    for (int i = 0; i < pufferl.hypers.horizon * pufferl.hypers.num_buffers; i++) {
+    for (int i = 0;
+            i < (pufferl.hypers.horizon + 1) * pufferl.hypers.num_buffers;
+            i++) {
         cudaGraphExecDestroy(pufferl.fused_rollout_cudagraphs[i]);
     }
 
@@ -2479,6 +2522,7 @@ void close_impl(PuffeRL& pufferl) {
     static_vec_close(pufferl.vec);
 
     free(pufferl.buffer_states);
+    free(pufferl.bootstrap_states);
     free(pufferl.buffer_activations);
     free(pufferl.fused_rollout_cudagraphs);
     free(pufferl.streams);

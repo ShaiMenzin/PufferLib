@@ -320,7 +320,12 @@ static void* static_omp_threadmanager(void* arg) {
                 cudaMemcpyHostToDevice, stream);
 #endif
         }
+        clock_gettime(CLOCK_MONOTONIC, &t0);
+        net_callback(ctx, buf, horizon);
         cudaStreamSynchronize(stream);
+        clock_gettime(CLOCK_MONOTONIC, &t1);
+        my_accum[EVAL_GPU] += (t1.tv_sec - t0.tv_sec) * 1000.0f
+            + (t1.tv_nsec - t0.tv_nsec) / 1e6f;
         atomic_store(&buffer_states[buf], OMP_WAITING);
     }
 }

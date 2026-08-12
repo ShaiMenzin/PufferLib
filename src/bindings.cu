@@ -572,7 +572,10 @@ PYBIND11_MODULE(_C, m) {
     py::class_<PrecisionTensor>(m, "PrecisionTensor")
         .def("__repr__", [](const PrecisionTensor& t) { return std::string(puf_repr(&t)); })
         .def("ndim", [](const PrecisionTensor& t) { return ndim(t.shape); })
-        .def("numel", [](const PrecisionTensor& t) { return numel(t.shape); });
+        .def("numel", [](const PrecisionTensor& t) { return numel(t.shape); })
+        .def_property_readonly("data_ptr", [](const PrecisionTensor& t) {
+            return (long long)t.data;
+        });
     py::class_<FloatTensor>(m, "FloatTensor")
         .def("__repr__", [](const FloatTensor& t) { return std::string(puf_repr(&t)); })
         .def("ndim", [](const FloatTensor& t) { return ndim(t.shape); })
@@ -585,6 +588,7 @@ PYBIND11_MODULE(_C, m) {
         .def_readwrite("logprobs", &RolloutBuf::logprobs)
         .def_readwrite("rewards", &RolloutBuf::rewards)
         .def_readwrite("terminals", &RolloutBuf::terminals)
+        .def_readwrite("episode_starts", &RolloutBuf::episode_starts)
         .def_readwrite("ratio", &RolloutBuf::ratio)
         .def_readwrite("importance", &RolloutBuf::importance);
 
@@ -624,6 +628,7 @@ PYBIND11_MODULE(_C, m) {
         .def_readwrite("muon", &PuffeRL::muon)
         .def_readwrite("hypers", &PuffeRL::hypers)
         .def_readwrite("rollouts", &PuffeRL::rollouts)
+        .def_readwrite("train_rollouts", &PuffeRL::train_rollouts)
         .def_readonly("epoch", &PuffeRL::epoch)
         .def_readonly("global_step", &PuffeRL::global_step)
         .def_readonly("last_log_time", &PuffeRL::last_log_time)
