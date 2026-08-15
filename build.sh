@@ -52,14 +52,25 @@ fi
 
 # Linux/mac
 PLATFORM="$(uname -s)"
+MACHINE="$(uname -m)"
+CUDA_LIB_DIRS=()
 if [ "$PLATFORM" = "Linux" ]; then
-    RAYLIB_NAME='raylib-5.5_linux_amd64'
+    case "$MACHINE" in
+        x86_64|amd64)
+            CUDA_LIB_DIRS=(/usr/lib/x86_64-linux-gnu)
+            ;;
+        aarch64|arm64)
+            CUDA_LIB_DIRS=(/usr/lib/aarch64-linux-gnu)
+            ;;
+        *)
+            echo "Error: unsupported Linux architecture '$MACHINE'" && exit 1
+            ;;
+    esac
     OMP_LIB=-lomp5
     SANITIZE_FLAGS=(-fsanitize=address,undefined,bounds,pointer-overflow,leak -fno-omit-frame-pointer)
     STANDALONE_LDFLAGS=(-lGL)
     SHARED_LDFLAGS=(-Bsymbolic-functions)
 else
-    RAYLIB_NAME='raylib-5.5_macos'
     OMP_LIB=-lomp
     SANITIZE_FLAGS=()
     STANDALONE_LDFLAGS=(-framework Cocoa -framework IOKit -framework CoreVideo -framework OpenGL)
@@ -86,19 +97,10 @@ download() {
     esac
 }
 
-RAYLIB_URL="https://github.com/raysan5/raylib/releases/download/5.5"
-if [ "$MODE" = "web" ]; then
-    RAYLIB_NAME='raylib-5.5_webassembly'
-    download "$RAYLIB_NAME" "$RAYLIB_URL/$RAYLIB_NAME.zip"
-else
-    download "$RAYLIB_NAME" "$RAYLIB_URL/$RAYLIB_NAME.tar.gz"
-fi
-
-RAYLIB_A="$RAYLIB_NAME/lib/libraylib.a"
-INCLUDES=(-I./$RAYLIB_NAME/include -I./src -I./vendor)
-LINK_ARCHIVES=("$RAYLIB_A")
 EXTRA_SRC=""
 EXTRA_LDFLAGS=()
+INCLUDES=(-I./src -I./vendor)
+LINK_ARCHIVES=()
 
 if [ "$ENV" = "constellation" ]; then
     SRC_DIR="constellation"
@@ -142,10 +144,35 @@ fi
 
 OUTPUT_NAME=${OUTPUT_NAME:-$ENV}
 
+needs_raylib=0
+if [ "$MODE" = "web" ] || grep -R -Eq '#[[:space:]]*include[[:space:]]*[<"](raylib|rlgl)\.h[>"]' "$SRC_DIR"; then
+    needs_raylib=1
+fi
+
+if (( needs_raylib )); then
+    RAYLIB_URL="https://github.com/raysan5/raylib/releases/download/5.5"
+    if [ "$MODE" = "web" ]; then
+        RAYLIB_NAME='raylib-5.5_webassembly'
+        download "$RAYLIB_NAME" "$RAYLIB_URL/$RAYLIB_NAME.zip"
+    elif [ "$PLATFORM" = "Linux" ] && [[ "$MACHINE" == x86_64 || "$MACHINE" == amd64 ]]; then
+        RAYLIB_NAME='raylib-5.5_linux_amd64'
+        download "$RAYLIB_NAME" "$RAYLIB_URL/$RAYLIB_NAME.tar.gz"
+    elif [ "$PLATFORM" = "Darwin" ]; then
+        RAYLIB_NAME='raylib-5.5_macos'
+        download "$RAYLIB_NAME" "$RAYLIB_URL/$RAYLIB_NAME.tar.gz"
+    else
+        echo "Error: no bundled Raylib archive is available for $PLATFORM/$MACHINE" && exit 1
+    fi
+    RAYLIB_A="$RAYLIB_NAME/lib/libraylib.a"
+    INCLUDES=(-I./$RAYLIB_NAME/include "${INCLUDES[@]}")
+    LINK_ARCHIVES=("${LINK_ARCHIVES[@]}" "$RAYLIB_A")
+fi
+
 # Standalone environment build
-# -mavx2 enables AVX2 intrinsics (__m256, _mm256_*) which drive.h and
-# src/bf16.h use directly. x86_64 only — strip if porting to ARM/Apple Silicon.
-SIMD_FLAGS=(-mavx2 -mfma)
+SIMD_FLAGS=()
+if [[ "$MACHINE" == x86_64 || "$MACHINE" == amd64 ]]; then
+    SIMD_FLAGS=(-mavx2 -mfma)
+fi
 if [ -n "$DEBUG" ] || [ "$MODE" = "local" ]; then
     CLANG_OPT=(-g -O0 "${CLANG_WARN[@]}" "${SANITIZE_FLAGS[@]}" "${SIMD_FLAGS[@]}")
     NVCC_OPT="-O0 -g"
@@ -200,7 +227,7 @@ for dir in /usr/local/cuda/include /usr/include; do
         break
     fi
 done
-for dir in /usr/local/cuda/lib64 /usr/lib/x86_64-linux-gnu; do
+for dir in /usr/local/cuda/lib64 "${CUDA_LIB_DIRS[@]}"; do
     if [ -f "$dir/libcudnn.so" ]; then
         CUDNN_LFLAG="-L$dir"
         break
@@ -220,7 +247,7 @@ NCCL_LFLAG=""
 for dir in /usr/include /usr/local/cuda/include; do
     if [ -f "$dir/nccl.h" ]; then NCCL_IFLAG="-I$dir"; break; fi
 done
-for dir in /usr/lib/x86_64-linux-gnu /usr/local/cuda/lib64; do
+for dir in "${CUDA_LIB_DIRS[@]}" /usr/local/cuda/lib64; do
     if [ -f "$dir/libnccl.so" ] || [ -f "$dir/libnccl.so.2" ]; then NCCL_LFLAG="-L$dir"; break; fi
 done
 if [ -z "$NCCL_IFLAG" ]; then
@@ -244,7 +271,12 @@ export CCACHE_BASEDIR="$(pwd)"
 export CCACHE_COMPILERCHECK=content
 NVCC="ccache $CUDA_HOME/bin/nvcc"
 CC="${CC:-$(command -v ccache >/dev/null && echo 'ccache clang' || echo 'clang')}"
-ARCH=${NVCC_ARCH:-native}
+if [ "$PLATFORM" = "Linux" ] && [[ "$MACHINE" == aarch64 || "$MACHINE" == arm64 ]]; then
+    DEFAULT_NVCC_ARCH=sm_90
+else
+    DEFAULT_NVCC_ARCH=native
+fi
+ARCH=${NVCC_ARCH:-$DEFAULT_NVCC_ARCH}
 
 PYTHON_INCLUDE=$(python -c "import sysconfig; print(sysconfig.get_path('include'))")
 PYBIND_INCLUDE=$(python -c "import pybind11; print(pybind11.get_include())")
@@ -266,7 +298,7 @@ echo "Compiling static library for $ENV..."
 ${CC:-clang} -c "${CLANG_OPT[@]}" $EXTRA_CFLAGS \
     -I. -Isrc -I$SRC_DIR -Ivendor \
     "${INCLUDES[@]}" \
-    -I./$RAYLIB_NAME/include -I$CUDA_HOME/include \
+    -I$CUDA_HOME/include \
     -DPLATFORM_DESKTOP \
     -fno-semantic-interposition -fvisibility=hidden \
     -fPIC -fopenmp \
@@ -289,7 +321,7 @@ if [ -z "$MODE" ]; then
         -std=c++17 \
         -I. -Isrc \
         -I$PYTHON_INCLUDE -I$PYBIND_INCLUDE -I$NUMPY_INCLUDE \
-        -I$CUDA_HOME/include $CUDNN_IFLAG $NCCL_IFLAG -I$RAYLIB_NAME/include \
+        -I$CUDA_HOME/include $CUDNN_IFLAG $NCCL_IFLAG \
         -Xcompiler=-fopenmp \
         -DOBS_TENSOR_T=$OBS_TENSOR_T \
         -DENV_NAME=$ENV \
@@ -298,7 +330,7 @@ if [ -z "$MODE" ]; then
 
     LINK_CMD=(
         ${CXX:-g++} -shared -fPIC -fopenmp
-        build/bindings.o "$STATIC_LIB" "$RAYLIB_A"
+        build/bindings.o "$STATIC_LIB" "${LINK_ARCHIVES[@]}"
         -L$CUDA_HOME/lib64 $CUDNN_LFLAG $NCCL_LFLAG
         "${WHEEL_RPATH_FLAGS[@]}"
         "${EXTRA_LDFLAGS[@]}"
@@ -324,7 +356,7 @@ elif [ "$MODE" = "cpu" ]; then
         src/bindings_cpu.cpp -o build/bindings_cpu.o
     LINK_CMD=(
         ${CXX:-g++} -shared -fPIC -fopenmp
-        build/bindings_cpu.o "$STATIC_LIB" "$RAYLIB_A"
+        build/bindings_cpu.o "$STATIC_LIB" "${LINK_ARCHIVES[@]}"
         "${EXTRA_LDFLAGS[@]}"
         -lm -lpthread $OMP_LIB $LINK_OPT
         "${SHARED_LDFLAGS[@]}"
@@ -337,14 +369,14 @@ elif [ "$MODE" = "profile" ]; then
     echo "Compiling profile binary ($ARCH)..."
     $NVCC $NVCC_OPT -arch=$ARCH -std=c++17 \
         -I. -Isrc -I$SRC_DIR -Ivendor \
-        -I$CUDA_HOME/include $CUDNN_IFLAG $NCCL_IFLAG -I$RAYLIB_NAME/include \
+        -I$CUDA_HOME/include $CUDNN_IFLAG $NCCL_IFLAG \
         -DOBS_TENSOR_T=$OBS_TENSOR_T \
         -DENV_NAME=$ENV \
         -Xcompiler=-DPLATFORM_DESKTOP \
         $PRECISION \
         -Xcompiler=-fopenmp \
         tests/profile_kernels.cu vendor/ini.c \
-        "$STATIC_LIB" "$RAYLIB_A" \
+        "$STATIC_LIB" "${LINK_ARCHIVES[@]}" \
         $NCCL_LINK_LIBRARY -lnvidia-ml -lcublas -lcurand $CUDNN_LINK_LIBRARY \
         -lGL -lm -lpthread $OMP_LIB \
         -o profile
