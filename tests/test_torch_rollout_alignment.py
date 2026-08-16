@@ -12,7 +12,7 @@ except ImportError:
     pufferlib._C = _C
     sys.modules["pufferlib._C"] = _C
 
-from pufferlib.torch_pufferl import PuffeRL, _torch_puff_advantage
+from pufferlib.torch_pufferl import PuffeRL, _torch_puff_advantage, sample_logits
 
 
 class _Profile:
@@ -107,3 +107,23 @@ def test_torch_advantage_matches_transition_alignment() -> None:
     )
 
     torch.testing.assert_close(result, torch.tensor([[3.5, 2.0]]))
+
+
+def test_sample_logits_preserves_equal_multidiscrete_head_layout() -> None:
+    logits = (
+        torch.tensor([[1.0, 2.0, 3.0], [3.0, 2.0, 1.0]]),
+        torch.tensor([[2.0, 1.0, 0.0], [0.0, 1.0, 2.0]]),
+    )
+    actions = torch.tensor([[2, 0], [0, 2]])
+
+    _, logprob, entropy = sample_logits(logits, action=actions)
+
+    stacked = torch.stack(logits, dim=0)
+    normalized = stacked - stacked.logsumexp(dim=-1, keepdim=True)
+    expected_logprob = normalized.gather(
+        -1,
+        actions.T.unsqueeze(-1),
+    ).squeeze(-1).sum(dim=0)
+    expected_entropy = -(normalized * normalized.exp()).sum(dim=-1).sum(dim=0)
+    torch.testing.assert_close(logprob, expected_logprob)
+    torch.testing.assert_close(entropy, expected_entropy)

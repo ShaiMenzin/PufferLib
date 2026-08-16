@@ -11,7 +11,6 @@ from collections import defaultdict
 
 import torch
 import torch.distributed
-from torch.distributions.utils import logits_to_probs
 
 import pufferlib
 import pufferlib.pufferl
@@ -46,7 +45,7 @@ def _log_prob(logits, value):
 def _entropy(logits):
     min_real = torch.finfo(logits.dtype).min
     logits = torch.clamp(logits, min=min_real)
-    p_log_p = logits * logits_to_probs(logits)
+    p_log_p = logits * logits.exp()
     return -p_log_p.sum(-1)
 
 def sample_logits(logits, action=None):
@@ -61,17 +60,19 @@ def sample_logits(logits, action=None):
     elif is_discrete:
         logits = logits.unsqueeze(0)
     else: # multi-discrete
-        logits = torch.nn.utils.rnn.pad_sequence(
-            [head.transpose(0,1) for head in logits],
-            batch_first=False,
-            padding_value=-torch.inf
-        ).permute(1,2,0)
+        if len({head.shape[-1] for head in logits}) == 1:
+            logits = torch.stack(logits, dim=0)
+        else:
+            logits = torch.nn.utils.rnn.pad_sequence(
+                [head.transpose(0, 1) for head in logits],
+                batch_first=False,
+                padding_value=-torch.inf,
+            ).permute(1, 2, 0)
 
     normalized_logits = logits - logits.logsumexp(dim=-1, keepdim=True)
-    probs = logits_to_probs(logits)
 
     if action is None:
-        probs = torch.nan_to_num(probs, 1e-8, 1e-8, 1e-8)
+        probs = torch.nan_to_num(normalized_logits.exp(), 1e-8, 1e-8, 1e-8)
         action = torch.multinomial(probs.reshape(-1, probs.shape[-1]), 1, replacement=True).int()
         action = action.reshape(probs.shape[:-1])
     else:
@@ -137,6 +138,8 @@ class PuffeRL:
         self.device = device
 
         torch.set_float32_matmul_precision('high')
+        if device.type == 'mps':
+            torch.set_num_threads(1)
         if device.type == 'cuda':
             torch.backends.cudnn.deterministic = True
             torch.backends.cudnn.benchmark = True
@@ -184,7 +187,7 @@ class PuffeRL:
 
         self.policy = policy
         self._forward_eval = policy.forward_eval
-        if args['torch'].get('compile_evaluation', False) and device.type == 'cuda':
+        if args['torch'].get('compile_evaluation', False) and device.type in {'cuda', 'mps'}:
             self._forward_eval = torch.compile(
                 self._forward_eval, mode='reduce-overhead', fullgraph=True)
         optimizer = config.get('optimizer', 'muon')
@@ -259,12 +262,12 @@ class PuffeRL:
             o_device = torch.as_tensor(o, device=device)
 
             prof.mark(1)
-            with torch.no_grad():
+            with torch.inference_mode():
                 logits, value, state = self._forward_eval(o_device, self.state)
                 action, logprob, _ = sample_logits(logits)
             prof.mark(2)
 
-            with torch.no_grad():
+            with torch.inference_mode():
                 self.state = state
                 self.observations[t] = o_device
                 self.actions[t] = action
@@ -402,7 +405,7 @@ class PuffeRL:
             loss.backward()
             torch.nn.utils.clip_grad_norm_(self.policy.parameters(), config['max_grad_norm'])
             self.optimizer.step()
-            self.optimizer.zero_grad()
+            self.optimizer.zero_grad(set_to_none=True)
             completed_minibatches += 1
             target_kl = config.get('target_kl', 0.0)
             if target_kl > 0 and approx_kl.item() > target_kl:
