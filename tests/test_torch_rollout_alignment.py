@@ -1,8 +1,9 @@
 import sys
 import types
 
-import pufferlib
 import torch
+
+import pufferlib
 
 try:
     from pufferlib import _C
