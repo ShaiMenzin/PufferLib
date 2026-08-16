@@ -1,8 +1,7 @@
 import numpy as np
-
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
+from torch import nn
 
 
 def reset_recurrent_state(state, terminals):
@@ -170,6 +169,11 @@ class MinGRU(nn.Module):
         if terminals.shape != h.shape[:2]:
             raise ValueError("terminals must have shape [batch, time]")
 
+        if not bool(terminals.any().item()) and not bool(
+            (state[0] < 0).any().item()
+        ):
+            return self._forward_train_recurrent_without_boundaries(h, state)
+
         outputs = []
         recurrent_state = tuple(value.clone() for value in state)
         for step in range(h.shape[1]):
@@ -177,6 +181,25 @@ class MinGRU(nn.Module):
             output, recurrent_state = self.forward_eval(h[:, step], recurrent_state)
             outputs.append(output)
         return torch.stack(outputs, dim=1)
+
+    def _forward_train_recurrent_without_boundaries(self, h, state):
+        recurrent_state = state[0]
+        for i in range(self.num_layers):
+            hidden, gate, proj = self.layers[i](h).chunk(3, dim=-1)
+            log_coeffs = -F.softplus(gate)
+            log_values = -F.softplus(-gate) + self._log_g(hidden)
+            initial_state = recurrent_state[i].clamp_min(torch.finfo(h.dtype).tiny)
+            initial_log = initial_state.log().unsqueeze(1)
+            initial_log_coeffs = log_coeffs.new_zeros(
+                log_coeffs.shape[0], 1, log_coeffs.shape[2]
+            )
+            scanned = self._heinsen_scan(
+                torch.cat((initial_log_coeffs, log_coeffs), dim=1),
+                torch.cat((initial_log, log_values), dim=1),
+            )
+            out = scanned[:, 1:]
+            h = self._highway(h, out, proj)
+        return h
 
 class LSTM(nn.Module):
     def __init__(self, hidden_size, num_layers=1, **kwargs):
