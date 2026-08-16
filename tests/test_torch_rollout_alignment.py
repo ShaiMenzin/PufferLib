@@ -12,7 +12,7 @@ except ImportError:
     pufferlib._C = _C
     sys.modules["pufferlib._C"] = _C
 
-from pufferlib.torch_pufferl import PuffeRL
+from pufferlib.torch_pufferl import PuffeRL, _torch_puff_advantage
 
 
 class _Profile:
@@ -83,3 +83,27 @@ def test_rollout_rewards_align_with_actions_and_bootstrap_the_final_state() -> N
 
     torch.testing.assert_close(trainer.rewards[:, 0], torch.tensor([10.0, 20.0]))
     torch.testing.assert_close(trainer.bootstrap_values, torch.tensor([2.0]))
+
+
+def test_torch_advantage_matches_transition_alignment() -> None:
+    values = torch.tensor([[1.0, 2.0]])
+    rewards = torch.tensor([[3.0, 4.0]])
+    terminals = torch.tensor([[0.0, 1.0]])
+    importance = torch.ones_like(values)
+    advantages = torch.zeros_like(values)
+    bootstrap_values = torch.tensor([5.0])
+
+    result = _torch_puff_advantage(
+        values,
+        rewards,
+        terminals,
+        importance,
+        advantages,
+        bootstrap_values,
+        0.5,
+        0.5,
+        1.0,
+        1.0,
+    )
+
+    torch.testing.assert_close(result, torch.tensor([[3.5, 2.0]]))

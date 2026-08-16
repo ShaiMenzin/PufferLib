@@ -175,7 +175,9 @@ static inline size_t obs_element_size(void) {
 #define  STRINGIFY(x)  _STRINGIFY(x)
 const char dtype_symbol[] = STRINGIFY(OBS_TENSOR_T);
 
+#ifdef _OPENMP
 #include <omp.h>
+#endif
 #include <stdatomic.h>
 #include <pthread.h>
 #include <stdbool.h>

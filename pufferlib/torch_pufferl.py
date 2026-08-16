@@ -102,6 +102,20 @@ _TORCH_TO_CTYPE = {
     torch.float32: ctypes.c_float,
 }
 
+
+def _training_device(args):
+    requested = args.get('torch', {}).get('device')
+    if requested in (None, 'auto'):
+        requested = 'cuda' if getattr(_C, 'gpu', 0) else 'cpu'
+        if requested == 'cpu' and torch.backends.mps.is_available():
+            requested = 'mps'
+    device = torch.device(requested)
+    if device.type == 'cuda' and not getattr(_C, 'gpu', 0):
+        raise RuntimeError('CUDA training requires a CUDA-enabled PufferLib backend')
+    if device.type == 'mps' and not torch.backends.mps.is_available():
+        raise RuntimeError('MPS training was requested but MPS is unavailable')
+    return device
+
 def _actions_for_vec_step(action):
     if action.dim() == 1:
         action = action.unsqueeze(-1)
@@ -119,12 +133,13 @@ def _cpu_tensor(ptr, shape, dtype):
 class PuffeRL:
     def __init__(self, args, vec, policy, verbose=True):
         config = args['train']
-        device = 'cuda' if _C.gpu else 'cpu'
+        device = _training_device(args)
         self.device = device
 
         torch.set_float32_matmul_precision('high')
-        torch.backends.cudnn.deterministic = True
-        torch.backends.cudnn.benchmark = True
+        if device.type == 'cuda':
+            torch.backends.cudnn.deterministic = True
+            torch.backends.cudnn.benchmark = True
 
         self._vec = vec
         self.gpu = vec.gpu
@@ -169,7 +184,7 @@ class PuffeRL:
 
         self.policy = policy
         self._forward_eval = policy.forward_eval
-        if args['torch'].get('compile_evaluation', False):
+        if args['torch'].get('compile_evaluation', False) and device.type == 'cuda':
             self._forward_eval = torch.compile(
                 self._forward_eval, mode='reduce-overhead', fullgraph=True)
         optimizer = config.get('optimizer', 'muon')
@@ -262,6 +277,8 @@ class PuffeRL:
             if self.gpu:
                 self._vec.gpu_step(actions_flat.data_ptr())
             else:
+                if actions_flat.device.type != 'cpu':
+                    actions_flat = actions_flat.cpu()
                 self._vec.cpu_step(actions_flat.data_ptr())
 
             o, r, d = self.vec_obs, self.vec_rewards, self.vec_terminals
@@ -463,7 +480,7 @@ class PuffeRL:
         if policy_factory is None:
             policy = load_policy(args, vec)
         else:
-            device = torch.device('cuda' if _C.gpu else 'cpu')
+            device = _training_device(args)
             policy = policy_factory(vec, device).to(device)
 
         if 'LOCAL_RANK' in os.environ:
@@ -479,9 +496,45 @@ class PuffeRL:
 
         return cls(args, vec, policy)
 
+def _torch_puff_advantage(values, rewards, terminals,
+        ratio, advantages, bootstrap_values, gamma, gae_lambda,
+        vtrace_rho_clip, vtrace_c_clip):
+    _, horizon = values.shape
+    lastpufferlam = torch.zeros_like(bootstrap_values)
+    next_value = bootstrap_values
+    rho_clip = values.new_tensor(vtrace_rho_clip)
+    c_clip = values.new_tensor(vtrace_c_clip)
+    for t in range(horizon - 1, -1, -1):
+        nextnonterminal = 1.0 - terminals[:, t]
+        rho_t = torch.minimum(ratio[:, t], rho_clip)
+        c_t = torch.minimum(ratio[:, t], c_clip)
+        delta = rho_t * (
+            rewards[:, t] + gamma * next_value * nextnonterminal - values[:, t]
+        )
+        lastpufferlam = (
+            delta + gamma * gae_lambda * c_t * lastpufferlam * nextnonterminal
+        )
+        advantages[:, t] = lastpufferlam
+        next_value = values[:, t]
+    return advantages
+
+
 def compute_puff_advantage(values, rewards, terminals,
         ratio, advantages, bootstrap_values, gamma, gae_lambda,
         vtrace_rho_clip, vtrace_c_clip):
+    if values.device.type == 'mps':
+        return _torch_puff_advantage(
+            values,
+            rewards,
+            terminals,
+            ratio,
+            advantages,
+            bootstrap_values,
+            gamma,
+            gae_lambda,
+            vtrace_rho_clip,
+            vtrace_c_clip,
+        )
     num_steps, horizon = values.shape
     fn = _C.puff_advantage if values.is_cuda else _C.puff_advantage_cpu
     fn(

@@ -50,7 +50,7 @@ if [ "$ENV" = "all" ]; then
     exit 0
 fi
 
-# Linux/mac
+# Linux/macOS
 PLATFORM="$(uname -s)"
 MACHINE="$(uname -m)"
 CUDA_LIB_DIRS=()
@@ -67,14 +67,18 @@ if [ "$PLATFORM" = "Linux" ]; then
             ;;
     esac
     OMP_LIB=-lomp5
+    OMP_FLAG=-fopenmp
     SANITIZE_FLAGS=(-fsanitize=address,undefined,bounds,pointer-overflow,leak -fno-omit-frame-pointer)
     STANDALONE_LDFLAGS=(-lGL)
     SHARED_LDFLAGS=(-Bsymbolic-functions)
-else
-    OMP_LIB=-lomp
+elif [ "$PLATFORM" = "Darwin" ]; then
+    OMP_LIB=""
+    OMP_FLAG=""
     SANITIZE_FLAGS=()
     STANDALONE_LDFLAGS=(-framework Cocoa -framework IOKit -framework CoreVideo -framework OpenGL)
     SHARED_LDFLAGS=(-framework Cocoa -framework OpenGL -framework IOKit -undefined dynamic_lookup)
+else
+    echo "Error: unsupported platform '$PLATFORM'" && exit 1
 fi
 
 CLANG_WARN=(
@@ -189,7 +193,7 @@ if [ "$MODE" = "local" ] || [ "$MODE" = "fast" ]; then
         "${LINK_ARCHIVES[@]}"
         "${EXTRA_LDFLAGS[@]}"
         "${STANDALONE_LDFLAGS[@]}"
-        -lm -lpthread -fopenmp
+        -lm -lpthread $OMP_FLAG
         -DPLATFORM_DESKTOP
     )
     echo "Compiling $ENV..."
@@ -218,7 +222,11 @@ elif [ "$MODE" = "web" ]; then
 fi
 
 # Find cuDNN path
-CUDA_HOME=${CUDA_HOME:-${CUDA_PATH:-$(dirname "$(dirname "$(which nvcc)")")}}
+if command -v nvcc >/dev/null 2>&1; then
+    CUDA_HOME=${CUDA_HOME:-${CUDA_PATH:-$(dirname "$(dirname "$(command -v nvcc)")")}}
+else
+    CUDA_HOME=${CUDA_HOME:-${CUDA_PATH:-/usr/local/cuda}}
+fi
 CUDNN_IFLAG=""
 CUDNN_LFLAG=""
 for dir in /usr/local/cuda/include /usr/include; do
@@ -301,7 +309,7 @@ ${CC:-clang} -c "${CLANG_OPT[@]}" $EXTRA_CFLAGS \
     -I$CUDA_HOME/include \
     -DPLATFORM_DESKTOP \
     -fno-semantic-interposition -fvisibility=hidden \
-    -fPIC -fopenmp \
+    -fPIC $OMP_FLAG \
     "$BINDING_SRC" -o "$STATIC_OBJ"
 ar rcs "$STATIC_LIB" "$STATIC_OBJ"
 
@@ -344,7 +352,7 @@ if [ -z "$MODE" ]; then
 
 elif [ "$MODE" = "cpu" ]; then
     echo "Compiling CPU training backend..."
-    ${CXX:-g++} -c -fPIC -fopenmp \
+    ${CXX:-g++} -c -fPIC $OMP_FLAG \
         -D_GLIBCXX_USE_CXX11_ABI=1 \
         -DPLATFORM_DESKTOP \
         -std=c++17 \
@@ -355,7 +363,7 @@ elif [ "$MODE" = "cpu" ]; then
         $PRECISION $LINK_OPT \
         src/bindings_cpu.cpp -o build/bindings_cpu.o
     LINK_CMD=(
-        ${CXX:-g++} -shared -fPIC -fopenmp
+        ${CXX:-g++} -shared -fPIC $OMP_FLAG
         build/bindings_cpu.o "$STATIC_LIB" "${LINK_ARCHIVES[@]}"
         "${EXTRA_LDFLAGS[@]}"
         -lm -lpthread $OMP_LIB $LINK_OPT
