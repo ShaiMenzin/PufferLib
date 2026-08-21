@@ -1,9 +1,9 @@
 import sys
 import types
 
-import torch
-
 import pufferlib
+import pytest
+import torch
 
 try:
     from pufferlib import _C
@@ -44,6 +44,37 @@ class _Vec:
 
     def log(self) -> dict[str, float]:
         return {}
+
+
+def test_create_pufferl_preserves_configured_num_buffers(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, int] = {}
+    vec = object()
+
+    class _Policy:
+        def to(self, _device: torch.device) -> "_Policy":
+            return self
+
+    policy = _Policy()
+
+    def create_vec(args: dict[str, object], _gpu: int) -> object:
+        vec_args = args["vec"]
+        assert isinstance(vec_args, dict)
+        captured["num_buffers"] = int(vec_args["num_buffers"])
+        return vec
+
+    def init(self: PuffeRL, _args: object, _vec: object, _policy: object) -> None:
+        pass
+
+    monkeypatch.setattr(_C, "gpu", 0, raising=False)
+    monkeypatch.setattr(_C, "create_vec", create_vec, raising=False)
+    monkeypatch.setattr(PuffeRL, "__init__", init)
+
+    args = {"vec": {"num_buffers": 2}, "torch": {"device": "cpu"}}
+    PuffeRL.create_pufferl(args, policy_factory=lambda _vec, _device: policy)
+
+    assert captured["num_buffers"] == 2
 
 
 def test_rollout_rewards_align_with_actions_and_bootstrap_the_final_state() -> None:

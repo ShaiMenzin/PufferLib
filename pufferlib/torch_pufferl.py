@@ -478,7 +478,6 @@ class PuffeRL:
             torch.cuda.set_device(local_rank)
             os.environ['CUDA_VISIBLE_DEVICES'] = str(local_rank)
 
-        args['vec']['num_buffers'] = 1
         vec = _C.create_vec(args, _C.gpu)
         if policy_factory is None:
             policy = load_policy(args, vec)
