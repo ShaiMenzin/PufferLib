@@ -140,11 +140,11 @@ __global__ void mingru_gate(precision_t* out, precision_t* next_state,
 
 // Prefix scan buffers
 struct PrefixScan {
-    precision_t* combined_ptr = nullptr;
-    precision_t* state_ptr = nullptr;
-    precision_t* input_ptr = nullptr;  // (B, T, H) original input before projection (for highway gate)
-    precision_t* episode_starts_ptr = nullptr;  // (B, T)
-    int B = 0, T = 0, H = 0;
+    precision_t* combined_ptr;
+    precision_t* state_ptr;
+    precision_t* input_ptr;  // (B, T, H) original input before projection (for highway gate)
+    precision_t* episode_starts_ptr;  // (B, T)
+    int B, T, H;
     FloatTensor a_star, s_vals, log_values_buf;
     PrecisionTensor out, next_state;
     PrecisionTensor grad_combined, grad_state;

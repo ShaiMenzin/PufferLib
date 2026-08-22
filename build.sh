@@ -66,11 +66,28 @@ if [ "$PLATFORM" = "Linux" ]; then
             echo "Error: unsupported Linux architecture '$MACHINE'" && exit 1
             ;;
     esac
-    OMP_LIB=-lomp5
     OMP_FLAG=-fopenmp
     SANITIZE_FLAGS=(-fsanitize=address,undefined,bounds,pointer-overflow,leak -fno-omit-frame-pointer)
     STANDALONE_LDFLAGS=(-lGL)
     SHARED_LDFLAGS=(-Bsymbolic-functions)
+    OMP_LFLAG=""
+    OMP_LIB=""
+    for omp_dir in "${CUDA_LIB_DIRS[@]}" /usr/lib /usr/lib/llvm-*/lib; do
+        if [ -f "$omp_dir/libomp5.so" ]; then
+            OMP_LFLAG="-L$omp_dir"
+            OMP_LIB=-lomp5
+            break
+        fi
+        if [ -f "$omp_dir/libomp.so" ]; then
+            OMP_LFLAG="-L$omp_dir"
+            OMP_LIB=-lomp
+            break
+        fi
+    done
+    if [ -z "$OMP_LIB" ]; then
+        echo "Error: LLVM OpenMP runtime not found; install libomp-dev" >&2
+        exit 1
+    fi
 elif [ "$PLATFORM" = "Darwin" ]; then
     OMP_LIB=""
     OMP_FLAG=""
@@ -277,8 +294,27 @@ done
 export CCACHE_DIR="${CCACHE_DIR:-$HOME/.ccache}"
 export CCACHE_BASEDIR="$(pwd)"
 export CCACHE_COMPILERCHECK=content
-NVCC="ccache $CUDA_HOME/bin/nvcc"
-CC="${CC:-$(command -v ccache >/dev/null && echo 'ccache clang' || echo 'clang')}"
+if command -v ccache >/dev/null 2>&1; then
+    NVCC=(ccache "$CUDA_HOME/bin/nvcc")
+else
+    NVCC=("$CUDA_HOME/bin/nvcc")
+fi
+if [ -n "${CC:-}" ]; then
+    C_COMPILER="$CC"
+else
+    C_COMPILER=""
+    for candidate in clang clang-18 clang-17; do
+        if command -v "$candidate" >/dev/null 2>&1 \
+            && "$candidate" --version >/dev/null 2>&1; then
+            C_COMPILER="$candidate"
+            break
+        fi
+    done
+    if [ -z "$C_COMPILER" ]; then
+        echo "Error: clang or a versioned clang compiler is required" >&2
+        exit 1
+    fi
+fi
 if [ "$PLATFORM" = "Linux" ] && [[ "$MACHINE" == aarch64 || "$MACHINE" == arm64 ]]; then
     DEFAULT_NVCC_ARCH=sm_90
 else
@@ -303,7 +339,7 @@ if [ ! -f "$BINDING_SRC" ]; then
 fi
 
 echo "Compiling static library for $ENV..."
-${CC:-clang} -c "${CLANG_OPT[@]}" $EXTRA_CFLAGS \
+"$C_COMPILER" -c "${CLANG_OPT[@]}" $EXTRA_CFLAGS \
     -I. -Isrc -I$SRC_DIR -Ivendor \
     "${INCLUDES[@]}" \
     -I$CUDA_HOME/include \
@@ -322,7 +358,7 @@ fi
 
 if [ -z "$MODE" ]; then
     echo "Compiling CUDA ($ARCH) training backend..."
-    $NVCC -c -arch=$ARCH -Xcompiler -fPIC \
+    "${NVCC[@]}" -c -arch=$ARCH -Xcompiler -fPIC \
         -Xcompiler=-D_GLIBCXX_USE_CXX11_ABI=1 \
         -Xcompiler=-DNPY_NO_DEPRECATED_API=NPY_1_7_API_VERSION \
         -Xcompiler=-DPLATFORM_DESKTOP \
@@ -339,7 +375,7 @@ if [ -z "$MODE" ]; then
     LINK_CMD=(
         ${CXX:-g++} -shared -fPIC -fopenmp
         build/bindings.o "$STATIC_LIB" "${LINK_ARCHIVES[@]}"
-        -L$CUDA_HOME/lib64 $CUDNN_LFLAG $NCCL_LFLAG
+        -L$CUDA_HOME/lib64 $CUDNN_LFLAG $NCCL_LFLAG $OMP_LFLAG
         "${WHEEL_RPATH_FLAGS[@]}"
         "${EXTRA_LDFLAGS[@]}"
         -lcudart $NCCL_LINK_LIBRARY -lnvidia-ml -lcublas -lcusolver -lcurand $CUDNN_LINK_LIBRARY
